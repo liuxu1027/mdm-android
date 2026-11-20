@@ -1,0 +1,25 @@
+[package]
+name = "mdm-android"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+name = "mdm_android"
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/uniffi_bindgen.rs"
+
+[dependencies]
+# 引入上游核心引擎与 BT 模块（需先将上游仓库放到 ../../upstream）
+mdm-engine = { path = "../../upstream/crates/engine" }
+mdm-torrent = { path = "../../upstream/crates/torrent" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "fs", "time"] }
+uniffi = { version = "0.28", features = ["cli"] }
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+log = "0.4"
+android_logger = "0.14"
