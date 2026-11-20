@@ -22,9 +22,36 @@ else:
 
 if FTP_RS.exists():
     text = FTP_RS.read_text(encoding="utf-8")
-    if "new_with_extra_roots" in text and 'target_os = "android"' not in text:
-        print(
-            "Note: Check upstream/crates/engine/src/ftp.rs to guard "
-            "new_with_extra_roots behind #[cfg(not(target_os = \"android\"))] "
-            "and use Verifier::new on Android."
+    # Fix: Verifier::new_with_extra_roots doesn't exist on Android in rustls-platform-verifier 0.7.1
+    # Use cfg attributes to use Verifier::new on Android, new_with_extra_roots elsewhere
+    old_code = """    let provider = crate::tls::provider();
+    let verifier = if extra.is_empty() {
+        Verifier::new(provider.clone())
+    } else {
+        Verifier::new_with_extra_roots(
+            extra.iter().map(|c| CertificateDer::from(c.clone())),
+            provider.clone(),
         )
+    }?;"""
+    new_code = """    let provider = crate::tls::provider();
+    #[cfg(not(target_os = "android"))]
+    let verifier = if extra.is_empty() {
+        Verifier::new(provider.clone())
+    } else {
+        Verifier::new_with_extra_roots(
+            extra.iter().map(|c| CertificateDer::from(c.clone())),
+            provider.clone(),
+        )
+    }?;
+    #[cfg(target_os = "android")]
+    let verifier = Verifier::new(provider.clone())?;"""
+    if old_code in text:
+        text = text.replace(old_code, new_code)
+        FTP_RS.write_text(text, encoding="utf-8")
+        print(f"Patched {FTP_RS}: guarded new_with_extra_roots for Android")
+    elif "new_with_extra_roots" in text and 'target_os = "android"' in text:
+        print(f"Already patched: {FTP_RS}")
+    else:
+        print(f"Warning: Could not find expected code pattern in {FTP_RS}")
+else:
+    print(f"Warning: {FTP_RS} not found.")
