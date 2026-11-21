@@ -261,6 +261,12 @@ impl DownloadEngine {
         };
 
         self.insert_task(task);
+        log::info!(
+            "[HTTP] 添加任务: {} -> {:?} (连接数 {})",
+            resolved_name,
+            save_path,
+            conns
+        );
         self.run_http(id.clone(), parsed, save_path, conns, false, 0);
 
         Ok(id)
@@ -290,6 +296,7 @@ impl DownloadEngine {
         };
 
         self.insert_task(task);
+        log::info!("[BT] 添加磁力任务: {}", display_name);
         self.run_torrent(id.clone(), src);
 
         Ok(id)
@@ -506,6 +513,13 @@ impl DownloadEngine {
             // 启动下载任务，必须在 tokio 运行时上下文里调用。在 UniFFI 的
             // JNI 线程上直接调用会 panic（"there is no reactor running"），
             // 任务行就永远卡在 0 B/s。移到 spawn 的异步块里就有了运行时上下文。
+            log::info!(
+                "[HTTP] 启动引擎: url={} dest={:?} 连接数={} resume={}",
+                req.url,
+                save_path,
+                connections,
+                resume
+            );
             let dl = Arc::new(if resume {
                 mdm_engine::download::Download::resume_or_start(
                     mdm_engine::state::state_path(&save_path),
@@ -517,13 +531,40 @@ impl DownloadEngine {
             } else {
                 mdm_engine::download::Download::start(req, opts)
             });
+            log::info!("[HTTP] 引擎已启动，开始轮询快照");
             if let Ok(mut h) = handles.lock() {
                 h.insert(task_id.clone(), Arc::clone(&dl));
             }
 
+            let mut polls: u64 = 0;
+            let mut last_state = String::new();
             loop {
                 let snap = dl.snapshot();
                 let speed: u64 = snap.connections.iter().map(|c| c.speed).sum();
+                polls += 1;
+                let state_name = format!("{:?}", snap.state);
+                if state_name != last_state {
+                    log::info!(
+                        "[HTTP] 状态变化: {} -> {} (已下 {} / 总计 {:?})",
+                        last_state,
+                        state_name,
+                        snap.downloaded,
+                        snap.size
+                    );
+                    last_state = state_name;
+                }
+                if polls % 10 == 0 {
+                    log::info!(
+                        "[HTTP] 轮询 #{}: 状态={:?} 已下={} 总计={:?} 速度={} 连接数={} 错误={:?}",
+                        polls,
+                        snap.state,
+                        snap.downloaded,
+                        snap.size,
+                        speed,
+                        snap.connections.len(),
+                        snap.error
+                    );
+                }
                 let terminal = match &snap.state {
                     EngineState::Done => Some(DownloadState::Completed),
                     EngineState::Failed => Some(DownloadState::Failed),
@@ -554,6 +595,13 @@ impl DownloadEngine {
                     }
                 });
                 if terminal.is_some() {
+                    log::info!(
+                        "[HTTP] 结束: 状态={:?} 已下={} 总计={} 错误={:?}",
+                        snap.state,
+                        downloaded,
+                        total,
+                        error
+                    );
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(500)).await;
@@ -616,9 +664,23 @@ impl DownloadEngine {
                 map.insert(task_id.clone(), hash.clone());
             }
 
+            let mut polls: u64 = 0;
             loop {
                 match session.stats(&hash) {
                     Ok(stats) => {
+                        polls += 1;
+                        if polls % 10 == 1 {
+                            log::info!(
+                                "[BT] 轮询 #{}: 阶段={:?} 已下={} 总计={} 速度={}  peers={} 错误={:?}",
+                                polls,
+                                stats.phase,
+                                stats.done,
+                                stats.total,
+                                stats.down_speed,
+                                stats.peers_live,
+                                stats.error
+                            );
+                        }
                         let terminal = match stats.phase {
                             TorrentPhase::Finished => Some(DownloadState::Completed),
                             TorrentPhase::Error => Some(DownloadState::Failed),
