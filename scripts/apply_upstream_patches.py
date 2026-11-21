@@ -29,9 +29,14 @@ if FTP_RS.exists():
     # new_with_extra_roots with mozilla_roots chained. Handle both shapes so the patch
     # survives upstream refactors.
     patched = False
-    new_shape_old = """    let verifier =
+    new_shape_old = """    let provider = crate::tls::provider();
+    let extra = extra.iter().map(|c| CertificateDer::from(c.clone()));
+    let verifier =
         Verifier::new_with_extra_roots(crate::tls::mozilla_roots().chain(extra), provider.clone())?;"""
-    new_shape_new = """    #[cfg(not(target_os = "android"))]
+    new_shape_new = """    let provider = crate::tls::provider();
+    #[cfg(not(target_os = "android"))]
+    let extra = extra.iter().map(|c| CertificateDer::from(c.clone()));
+    #[cfg(not(target_os = "android"))]
     let verifier =
         Verifier::new_with_extra_roots(crate::tls::mozilla_roots().chain(extra), provider.clone())?;
     #[cfg(target_os = "android")]
