@@ -59,3 +59,26 @@ dependencies {
     // UniFFI Kotlin 依赖 JNA 调用原生 .so
     implementation("net.java.dev.jna:jna:5.14.0@aar")
 }
+
+// libmdm_android.so 链接了 NDK 的 C++ 共享运行时，APK 里必须自带它，
+// 否则启动时 dlopen 失败（libc++_shared.so not found）直接闪退。
+// 构建前从 NDK 里把它拷到 jniLibs，让 Gradle 打进 APK。
+tasks.register("copyLibcxxShared") {
+    doLast {
+        val ndkDir = android.ndkDirectory
+        val src = ndkDir.resolve(
+            "toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so"
+        )
+        if (!src.exists()) {
+            throw GradleException("找不到 libc++_shared.so：${src.absolutePath}")
+        }
+        val destDir = layout.projectDirectory.dir("src/main/jniLibs/arm64-v8a").asFile
+        destDir.mkdirs()
+        src.copyTo(destDir.resolve("libc++_shared.so"), overwrite = true)
+        println("已复制 libc++_shared.so 到 jniLibs")
+    }
+}
+
+tasks.named("preBuild") {
+    dependsOn("copyLibcxxShared")
+}
