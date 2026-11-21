@@ -23,3 +23,24 @@ thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 log = "0.4"
 android_logger = "0.14"
+
+# 上游 workspace 根 Cargo.toml 里的 [patch.crates-io] 在这里构建时不生效：这里以
+# crates/mdm-android 为根构建，上游的 patch 只在以上游为根构建时才起作用。没有它，
+# librqbit 会从 crates.io 取 9.1.0，而上游 mdm-torrent 用的 peer_filter /
+# metadata_progress / piece_order / 单个 torrent 的 ratelimits 等 API 只存在于上游
+# 作者的 rqbit fork（与上游 Cargo.lock 锁定的提交一致），于是构建报 15 个编译错误
+# （Build #9，提交 d95f940）。这里只补与本次构建有关的 librqbit 系列；上游的
+# egui / wgpu / winit 等 patch 与 Android 构建无关，不必复制。
+[patch.crates-io]
+librqbit = { git = "https://github.com/anefzaoui/rqbit.git", rev = "c99ca4b4602e586437912bc9adecbe1111f1ee25" }
+librqbit-bencode = { git = "https://github.com/anefzaoui/rqbit.git", rev = "c99ca4b4602e586437912bc9adecbe1111f1ee25" }
+librqbit-buffers = { git = "https://github.com/anefzaoui/rqbit.git", rev = "c99ca4b4602e586437912bc9adecbe1111f1ee25" }
+librqbit-clone-to-owned = { git = "https://github.com/anefzaoui/rqbit.git", rev = "c99ca4b4602e586437912bc9adecbe1111f1ee25" }
+librqbit-core = { git = "https://github.com/anefzaoui/rqbit.git", rev = "c99ca4b4602e586437912bc9adecbe1111f1ee25" }
+librqbit-dht = { git = "https://github.com/anefzaoui/rqbit.git", rev = "c99ca4b4602e586437912bc9adecbe1111f1ee25" }
+librqbit-lsd = { git = "https://github.com/anefzaoui/rqbit.git", rev = "c99ca4b4602e586437912bc9adecbe1111f1ee25" }
+librqbit-peer-protocol = { git = "https://github.com/anefzaoui/rqbit.git", rev = "c99ca4b4602e586437912bc9adecbe1111f1ee25" }
+librqbit-sha1-wrapper = { git = "https://github.com/anefzaoui/rqbit.git", rev = "c99ca4b4602e586437912bc9adecbe1111f1ee25" }
+librqbit-tracker-comms = { git = "https://github.com/anefzaoui/rqbit.git", rev = "c99ca4b4602e586437912bc9adecbe1111f1ee25" }
+librqbit-upnp = { git = "https://github.com/anefzaoui/rqbit.git", rev = "c99ca4b4602e586437912bc9adecbe1111f1ee25" }
+librqbit-utp = { git = "https://github.com/ikatson/librqbit-utp.git", rev = "06e1c53c8df6edb2830d6aab64a6d4bed8479908" }
