@@ -1,16 +1,38 @@
 package com.mdm.android.ui
 
 import android.app.Application
+import android.content.Context
 import android.content.Intent
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import com.mdm.android.service.DownloadForegroundService
 import com.mdm.android.service.EngineRegistry
 import kotlinx.coroutines.flow.StateFlow
+import uniffi.mdm_android.DownloadState
 import uniffi.mdm_android.DownloadTask
+import java.io.File
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     val tasks: StateFlow<List<DownloadTask>> = EngineRegistry.tasks
+
+    private val prefs =
+        application.getSharedPreferences("mdm_settings", Context.MODE_PRIVATE)
+
+    /** 每任务默认连接数（1-16），新下载生效。 */
+    var maxConnections by mutableStateOf(prefs.getInt("max_connections", 8))
+        private set
+
+    /** 全局限速 bytes/s，0 = 不限速。 */
+    var speedLimitBps by mutableLongStateOf(prefs.getLong("speed_limit_bps", 0L))
+        private set
+
+    /** 下载保存目录（只读展示）。 */
+    val downloadDir: String =
+        File(application.getExternalFilesDir(null) ?: application.filesDir, "downloads").absolutePath
 
     fun ensureServiceStarted() {
         val ctx = getApplication<Application>()
@@ -18,6 +40,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             ctx,
             Intent(ctx, DownloadForegroundService::class.java)
         )
+    }
+
+    fun setMaxConnections(value: Int) {
+        val v = value.coerceIn(1, 16)
+        maxConnections = v
+        prefs.edit().putInt("max_connections", v).apply()
+        EngineRegistry.engine?.setDefaultConnections(v.toUInt())
+    }
+
+    fun setSpeedLimitBps(value: Long) {
+        val v = value.coerceAtLeast(0L)
+        speedLimitBps = v
+        prefs.edit().putLong("speed_limit_bps", v).apply()
+        EngineRegistry.engine?.setSpeedLimitBps(v.toULong())
     }
 
     fun addLink(rawInput: String) {
@@ -46,5 +82,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun remove(id: String) {
         runCatching { EngineRegistry.engine?.removeTask(id) }
+    }
+
+    fun clearFinished() {
+        tasks.value
+            .filter { it.state == DownloadState.COMPLETED || it.state == DownloadState.FAILED }
+            .forEach { remove(it.id) }
     }
 }
