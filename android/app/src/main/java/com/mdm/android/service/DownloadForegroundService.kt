@@ -25,6 +25,9 @@ class DownloadForegroundService : Service(), ProgressListener {
         super.onCreate()
         val downloadDir = File(getExternalFilesDir(null) ?: filesDir, "downloads").apply { mkdirs() }
         engine = DownloadEngine(downloadDir.absolutePath).apply {
+            val prefs = getSharedPreferences("mdm_settings", Context.MODE_PRIVATE)
+            setDefaultConnections(prefs.getInt("max_connections", 8).toUInt())
+            setSpeedLimitBps(prefs.getLong("speed_limit_bps", 0L).toULong())
             setListener(this@DownloadForegroundService)
         }
         EngineRegistry.attach(engine!!)
@@ -36,7 +39,8 @@ class DownloadForegroundService : Service(), ProgressListener {
             ACTION_ADD_HTTP -> {
                 val url = intent.getStringExtra(EXTRA_URL)
                 if (!url.isNullOrBlank()) {
-                    runCatching { engine?.addHttpDownload(url, null, 8u) }
+                    // 连接数传 0 = 用设置里的默认值
+                    runCatching { engine?.addHttpDownload(url, null, 0u) }
                 }
             }
             ACTION_ADD_MAGNET -> {
