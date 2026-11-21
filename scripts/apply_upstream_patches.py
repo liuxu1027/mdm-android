@@ -23,7 +23,24 @@ else:
 if FTP_RS.exists():
     text = FTP_RS.read_text(encoding="utf-8")
     # Fix: Verifier::new_with_extra_roots doesn't exist on Android in rustls-platform-verifier 0.7.1
-    # Use cfg attributes to use Verifier::new on Android, new_with_extra_roots elsewhere
+    # Use cfg attributes to use Verifier::new on Android, new_with_extra_roots elsewhere.
+    # Upstream refactored client_config: the old if/else block (Verifier::new when extra is
+    # empty, else new_with_extra_roots) is gone; current code always calls
+    # new_with_extra_roots with mozilla_roots chained. Handle both shapes so the patch
+    # survives upstream refactors.
+    patched = False
+    new_shape_old = """    let verifier =
+        Verifier::new_with_extra_roots(crate::tls::mozilla_roots().chain(extra), provider.clone())?;"""
+    new_shape_new = """    #[cfg(not(target_os = "android"))]
+    let verifier =
+        Verifier::new_with_extra_roots(crate::tls::mozilla_roots().chain(extra), provider.clone())?;
+    #[cfg(target_os = "android")]
+    let verifier = Verifier::new(provider.clone())?;"""
+    if new_shape_new in text:
+        print(f"Already patched (new shape): {FTP_RS}")
+    elif new_shape_old in text:
+        text = text.replace(new_shape_old, new_shape_new)
+        patched = True
     old_code = """    let provider = crate::tls::provider();
     let verifier = if extra.is_empty() {
         Verifier::new(provider.clone())
@@ -45,8 +62,12 @@ if FTP_RS.exists():
     }?;
     #[cfg(target_os = "android")]
     let verifier = Verifier::new(provider.clone())?;"""
-    if old_code in text:
+    if new_code in text:
+        print(f"Already patched (old shape): {FTP_RS}")
+    elif old_code in text:
         text = text.replace(old_code, new_code)
+        patched = True
+    if patched:
         FTP_RS.write_text(text, encoding="utf-8")
         print(f"Patched {FTP_RS}: guarded new_with_extra_roots for Android")
     elif "new_with_extra_roots" in text and 'target_os = "android"' in text:
