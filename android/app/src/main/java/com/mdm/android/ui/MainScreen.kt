@@ -106,8 +106,8 @@ fun MainScreen(viewModel: MainViewModel) {
             maxConnections = viewModel.maxConnections,
             speedLimitBps = viewModel.speedLimitBps,
             downloadDir = viewModel.downloadDir,
-            onConnectionsChange = { viewModel.setMaxConnections(it) },
-            onSpeedLimitChange = { viewModel.setSpeedLimitBps(it) },
+            onConnectionsChange = { viewModel.updateMaxConnections(it) },
+            onSpeedLimitChange = { viewModel.updateSpeedLimitBps(it) },
             onDismiss = { showSettings = false }
         )
     }
