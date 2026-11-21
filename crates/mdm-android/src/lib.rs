@@ -248,7 +248,7 @@ impl DownloadEngine {
 
         let task = DownloadTask {
             id: id.clone(),
-            title: resolved_name,
+            title: resolved_name.clone(),
             source_url: url.clone(),
             save_path: save_path.to_string_lossy().to_string(),
             kind: DownloadKind::Http,
@@ -283,7 +283,7 @@ impl DownloadEngine {
 
         let task = DownloadTask {
             id: id.clone(),
-            title: display_name,
+            title: display_name.clone(),
             source_url: magnet_uri.clone(),
             save_path: save_path.to_string_lossy().to_string(),
             kind: DownloadKind::TorrentMagnet,
