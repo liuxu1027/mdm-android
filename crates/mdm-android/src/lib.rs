@@ -112,9 +112,14 @@ async fn get_torrent_session(
     // DHT + trackers are enough for most torrents.
     cfg.upnp = false;
     cfg.lsd = false;
-    let session = Torrents::start(cfg)
+    // Torrents::start 本身没有超时；它在手机上可能一直卡住（监听/DHT 初始化），
+    // 必须加超时，否则任务永远停在“等待开始”，连失败信息都没有。
+    log::info!("正在启动 BT 会话…");
+    let session = tokio::time::timeout(Duration::from_secs(30), Torrents::start(cfg))
         .await
+        .map_err(|_| "启动 BT 会话超时（30 秒）".to_string())?
         .map_err(|e| format!("启动 BT 会话失败: {e}"))?;
+    log::info!("BT 会话已启动");
     let session = Arc::new(session);
     *guard = Some(Arc::clone(&session));
     Ok(session)
@@ -571,21 +576,25 @@ impl DownloadEngine {
             let session = match get_torrent_session(&slot, &download_dir).await {
                 Ok(s) => s,
                 Err(e) => {
+                    log::error!("BT 会话启动失败: {e}");
                     fail_task(&tasks, &listener, &task_id, e);
                     return;
                 }
             };
 
+            log::info!("正在获取种子信息…");
             let meta = match session
                 .metadata(&src, Duration::from_secs(120), None)
                 .await
             {
                 Ok(m) => m,
                 Err(e) => {
+                    log::error!("获取种子信息失败: {e}");
                     fail_task(&tasks, &listener, &task_id, format!("获取种子信息失败: {e}"));
                     return;
                 }
             };
+            log::info!("已获取种子信息: {} ({} 字节)", meta.name, meta.total());
             let folder = meta.folder_in(&download_dir);
             update_task(&tasks, &listener, &task_id, |t| {
                 t.title = meta.name.clone();
