@@ -42,14 +42,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         )
     }
 
-    fun setMaxConnections(value: Int) {
+    fun updateMaxConnections(value: Int) {
         val v = value.coerceIn(1, 16)
         maxConnections = v
         prefs.edit().putInt("max_connections", v).apply()
         EngineRegistry.engine?.setDefaultConnections(v.toUInt())
     }
 
-    fun setSpeedLimitBps(value: Long) {
+    fun updateSpeedLimitBps(value: Long) {
         val v = value.coerceAtLeast(0L)
         speedLimitBps = v
         prefs.edit().putLong("speed_limit_bps", v).apply()
