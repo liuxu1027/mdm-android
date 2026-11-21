@@ -63,10 +63,18 @@ dependencies {
 // libmdm_android.so 链接了 NDK 的 C++ 共享运行时，APK 里必须自带它，
 // 否则启动时 dlopen 失败（libc++_shared.so not found）直接闪退。
 // 构建前从 NDK 里把它拷到 jniLibs，让 Gradle 打进 APK。
+// 注意：不要用 android.ndkDirectory，它在 CI 上会报 "NDK is not installed"；
+// 直接读 workflow 里设置的 ANDROID_NDK_HOME 环境变量。
 tasks.register("copyLibcxxShared") {
     doLast {
-        val ndkDir = android.ndkDirectory
-        val src = ndkDir.resolve(
+        val ndkHome = System.getenv("ANDROID_NDK_HOME")
+            ?: System.getenv("ANDROID_NDK_ROOT")
+            ?: System.getenv("ANDROID_HOME")?.let { home ->
+                File(home, "ndk").listFiles()?.maxByOrNull { f -> f.name }?.absolutePath
+            }
+            ?: throw GradleException("找不到 NDK：ANDROID_NDK_HOME 未设置")
+        val src = File(
+            ndkHome,
             "toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so"
         )
         if (!src.exists()) {
