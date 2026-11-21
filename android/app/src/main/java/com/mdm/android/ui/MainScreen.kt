@@ -5,9 +5,11 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -24,6 +26,7 @@ fun MainScreen(viewModel: MainViewModel) {
     val tasks by viewModel.tasks.collectAsState()
     var selectedTab by remember { mutableIntStateOf(0) }
     var showAddDialog by remember { mutableStateOf(false) }
+    var showSettings by remember { mutableStateOf(false) }
 
     val filteredTasks = remember(tasks, selectedTab) {
         when (selectedTab) {
@@ -32,10 +35,25 @@ fun MainScreen(viewModel: MainViewModel) {
             else -> tasks
         }
     }
+    val hasFinished = tasks.any {
+        it.state == DownloadState.COMPLETED || it.state == DownloadState.FAILED
+    }
 
     Scaffold(
         topBar = {
-            TopAppBar(title = { Text("Mister Download Manager") })
+            TopAppBar(
+                title = { Text("Mister Download Manager") },
+                actions = {
+                    if (hasFinished) {
+                        IconButton(onClick = { viewModel.clearFinished() }) {
+                            Icon(Icons.Default.Clear, contentDescription = "清除已完成")
+                        }
+                    }
+                    IconButton(onClick = { showSettings = true }) {
+                        Icon(Icons.Default.Settings, contentDescription = "设置")
+                    }
+                }
+            )
         },
         floatingActionButton = {
             FloatingActionButton(onClick = { showAddDialog = true }) {
@@ -82,6 +100,17 @@ fun MainScreen(viewModel: MainViewModel) {
             }
         )
     }
+
+    if (showSettings) {
+        SettingsDialog(
+            maxConnections = viewModel.maxConnections,
+            speedLimitBps = viewModel.speedLimitBps,
+            downloadDir = viewModel.downloadDir,
+            onConnectionsChange = { viewModel.setMaxConnections(it) },
+            onSpeedLimitChange = { viewModel.setSpeedLimitBps(it) },
+            onDismiss = { showSettings = false }
+        )
+    }
 }
 
 @Composable
@@ -124,7 +153,28 @@ private fun DownloadTaskCard(
             }
             Spacer(modifier = Modifier.height(8.dp))
             LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth())
-            Spacer(modifier = Modifier.height(8.dp))
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = if (task.totalBytes > 0uL) {
+                    "${formatSize(task.downloadedBytes.toLong())} / ${formatSize(task.totalBytes.toLong())} · ${(progress * 100).toInt()}%"
+                } else if (task.downloadedBytes > 0uL) {
+                    "已下载 ${formatSize(task.downloadedBytes.toLong())}"
+                } else {
+                    "等待开始…"
+                },
+                style = MaterialTheme.typography.bodySmall
+            )
+            if (task.errorMessage != null) {
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = task.errorMessage!!,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            Spacer(modifier = Modifier.height(4.dp))
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -181,4 +231,75 @@ private fun formatSpeed(bytesPerSec: Long): String = when {
     bytesPerSec >= 1024 * 1024 -> String.format("%.1f MB/s", bytesPerSec / (1024.0 * 1024.0))
     bytesPerSec >= 1024 -> String.format("%.1f KB/s", bytesPerSec / 1024.0)
     else -> "$bytesPerSec B/s"
+}
+
+private fun formatSize(bytes: Long): String = when {
+    bytes >= 1024 * 1024 * 1024 -> String.format("%.2f GB", bytes / (1024.0 * 1024.0 * 1024.0))
+    bytes >= 1024 * 1024 -> String.format("%.1f MB", bytes / (1024.0 * 1024.0))
+    bytes >= 1024 -> String.format("%.1f KB", bytes / 1024.0)
+    else -> "$bytes B"
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun SettingsDialog(
+    maxConnections: Int,
+    speedLimitBps: Long,
+    downloadDir: String,
+    onConnectionsChange: (Int) -> Unit,
+    onSpeedLimitChange: (Long) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val speedOptions = listOf(
+        0L to "不限速",
+        512L * 1024 to "500 KB/s",
+        1024L * 1024 to "1 MB/s",
+        5L * 1024 * 1024 to "5 MB/s",
+        10L * 1024 * 1024 to "10 MB/s"
+    )
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("设置") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                Column {
+                    Text("下载目录", style = MaterialTheme.typography.titleSmall)
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(downloadDir, style = MaterialTheme.typography.bodySmall)
+                }
+                Column {
+                    Text(
+                        "每任务连接数：$maxConnections",
+                        style = MaterialTheme.typography.titleSmall
+                    )
+                    Slider(
+                        value = maxConnections.toFloat(),
+                        onValueChange = { onConnectionsChange(it.toInt()) },
+                        valueRange = 1f..16f,
+                        steps = 14
+                    )
+                    Text(
+                        "连接越多越快，但部分服务器会限制；新下载生效",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+                Column {
+                    Text("全局限速", style = MaterialTheme.typography.titleSmall)
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        speedOptions.forEach { (bps, label) ->
+                            FilterChip(
+                                selected = speedLimitBps == bps,
+                                onClick = { onSpeedLimitChange(bps) },
+                                label = { Text(label) }
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("完成") }
+        }
+    )
 }
