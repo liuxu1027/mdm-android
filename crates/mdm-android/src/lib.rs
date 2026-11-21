@@ -493,25 +493,29 @@ impl DownloadEngine {
             dest: Destination::Free(save_path.clone()),
         };
 
-        let dl = Arc::new(if resume {
-            mdm_engine::download::Download::resume_or_start(
-                mdm_engine::state::state_path(&save_path),
-                req,
-                opts,
-                None,
-                shown,
-            )
-        } else {
-            mdm_engine::download::Download::start(req, opts)
-        });
-        if let Ok(mut handles) = self.http_handles.lock() {
-            handles.insert(task_id.clone(), Arc::clone(&dl));
-        }
-
         let tasks = Arc::clone(&self.tasks);
         let listener = Arc::clone(&self.listener);
         let handles = Arc::clone(&self.http_handles);
         self.runtime.spawn(async move {
+            // 关键修复：Download::start / resume_or_start 内部用 tokio::spawn
+            // 启动下载任务，必须在 tokio 运行时上下文里调用。在 UniFFI 的
+            // JNI 线程上直接调用会 panic（"there is no reactor running"），
+            // 任务行就永远卡在 0 B/s。移到 spawn 的异步块里就有了运行时上下文。
+            let dl = Arc::new(if resume {
+                mdm_engine::download::Download::resume_or_start(
+                    mdm_engine::state::state_path(&save_path),
+                    req,
+                    opts,
+                    None,
+                    shown,
+                )
+            } else {
+                mdm_engine::download::Download::start(req, opts)
+            });
+            if let Ok(mut h) = handles.lock() {
+                h.insert(task_id.clone(), Arc::clone(&dl));
+            }
+
             loop {
                 let snap = dl.snapshot();
                 let speed: u64 = snap.connections.iter().map(|c| c.speed).sum();
