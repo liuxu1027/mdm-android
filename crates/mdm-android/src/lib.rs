@@ -317,6 +317,7 @@ impl DownloadEngine {
             total_bytes: 0,
             downloaded_bytes: 0,
             speed_bytes_per_sec: 0,
+            upload_speed_bytes_per_sec: 0,
             active_connections: conns.clamp(1, 32),
             error_message: None,
         };
@@ -380,6 +381,7 @@ impl DownloadEngine {
             total_bytes: 0,
             downloaded_bytes: 0,
             speed_bytes_per_sec: 0,
+            upload_speed_bytes_per_sec: 0,
             active_connections: 0,
             error_message: None,
         };
@@ -409,6 +411,7 @@ impl DownloadEngine {
             total_bytes: 0,
             downloaded_bytes: 0,
             speed_bytes_per_sec: 0,
+            upload_speed_bytes_per_sec: 0,
             active_connections: 0,
             error_message: None,
         };
@@ -443,6 +446,7 @@ impl DownloadEngine {
             total_bytes: 0,
             downloaded_bytes: 0,
             speed_bytes_per_sec: 0,
+            upload_speed_bytes_per_sec: 0,
             active_connections: 0,
             error_message: None,
         };
