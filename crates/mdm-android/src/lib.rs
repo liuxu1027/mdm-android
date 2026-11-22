@@ -745,14 +745,51 @@ impl DownloadEngine {
                     return;
                 }
             };
-            let result = hls::download_hls(&client, url.as_str(), &save_path, &cancel, |downloaded, total, speed| {
-                update_task(&tasks, &listener, &task_id, |t| {
-                    t.downloaded_bytes = downloaded;
-                    t.total_bytes = total;
-                    t.speed_bytes_per_sec = speed;
-                });
-            })
-            .await;
+            // 出错自动重试：分片拉取失败（网关抖动）时先自己重试，
+            // 每次都靠断点续传进度文件从断的地方接着下；3 次都不行才标失败。
+            // 还没下到任何字节就失败的（链接失效、地址不对）不重试，立即报错。
+            const HLS_MAX_ATTEMPTS: u32 = 4; // 首次 + 3 次自动重试
+            const HLS_RETRY_DELAY_SECS: u64 = 30;
+            let mut attempt = 0u32;
+            let result: Result<(), String> = loop {
+                attempt += 1;
+                let r = hls::download_hls(&client, url.as_str(), &save_path, &cancel, |downloaded, total, speed| {
+                    update_task(&tasks, &listener, &task_id, |t| {
+                        t.downloaded_bytes = downloaded;
+                        t.total_bytes = total;
+                        t.speed_bytes_per_sec = speed;
+                    });
+                })
+                .await;
+                if r.is_ok() {
+                    break r;
+                }
+                let e = r.unwrap_err();
+                if e == hls::ERR_CANCELLED {
+                    break Err(e);
+                }
+                // 已下字节数（回调里写进任务了）：0 字节说明播放列表都没拉到，
+                // 多半是链接失效，重试也没用；有进度才值得等一会儿再试。
+                let downloaded = tasks
+                    .lock()
+                    .map(|map| map.get(&task_id).map(|t| t.downloaded_bytes).unwrap_or(0))
+                    .unwrap_or(0);
+                if downloaded == 0 || attempt >= HLS_MAX_ATTEMPTS {
+                    break Err(e);
+                }
+                log::warn!(
+                    "[HLS] 第 {attempt} 次尝试失败（已下 {downloaded} 字节），{HLS_RETRY_DELAY_SECS} 秒后自动重试: {e}"
+                );
+                for _ in 0..HLS_RETRY_DELAY_SECS {
+                    if cancel.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+                if cancel.load(Ordering::Relaxed) {
+                    break Err(hls::ERR_CANCELLED.to_string());
+                }
+            };
             match result {
                 Ok(()) => {
                     update_task(&tasks, &listener, &task_id, |t| {
