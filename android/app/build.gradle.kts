@@ -45,6 +45,12 @@ android {
         }
     }
 
+    // Release 构建默认跑 lintVital 检查，但 CI 上 lint 自己的依赖
+    //（groovy、kotlin-reflect 等）解析失败会导致构建失败；本应用不需要这项检查。
+    lint {
+        checkReleaseBuilds = false
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
