@@ -4,6 +4,7 @@ import android.app.Application
 import android.content.Context
 import android.content.Intent
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -64,6 +65,51 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         uploadLimitBps = v
         prefs.edit().putLong("upload_limit_bps", v).apply()
         EngineRegistry.engine?.setUploadLimitBps(v.toULong())
+    }
+
+    /** m3u8 出错自动重试（对标 1DM 的重试设置）。 */
+    var retryEnabled by mutableStateOf(prefs.getBoolean("retry_enabled", true))
+        private set
+    var retryMaxAttempts by mutableIntStateOf(prefs.getInt("retry_max_attempts", 999999))
+        private set
+    var retryDelaySecs by mutableIntStateOf(prefs.getInt("retry_delay_secs", 5))
+        private set
+    var retryAlways by mutableStateOf(prefs.getBoolean("retry_always", false))
+        private set
+
+    private fun applyRetrySettings() {
+        EngineRegistry.engine?.setRetrySettings(
+            retryEnabled,
+            retryMaxAttempts.toUInt(),
+            retryDelaySecs.toUInt(),
+            retryAlways
+        )
+    }
+
+    fun updateRetryEnabled(value: Boolean) {
+        retryEnabled = value
+        prefs.edit().putBoolean("retry_enabled", value).apply()
+        applyRetrySettings()
+    }
+
+    fun updateRetryMaxAttempts(value: Int) {
+        val v = value.coerceAtLeast(0)
+        retryMaxAttempts = v
+        prefs.edit().putInt("retry_max_attempts", v).apply()
+        applyRetrySettings()
+    }
+
+    fun updateRetryDelaySecs(value: Int) {
+        val v = value.coerceAtLeast(0)
+        retryDelaySecs = v
+        prefs.edit().putInt("retry_delay_secs", v).apply()
+        applyRetrySettings()
+    }
+
+    fun updateRetryAlways(value: Boolean) {
+        retryAlways = value
+        prefs.edit().putBoolean("retry_always", value).apply()
+        applyRetrySettings()
     }
 
     fun addLink(rawInput: String) {
