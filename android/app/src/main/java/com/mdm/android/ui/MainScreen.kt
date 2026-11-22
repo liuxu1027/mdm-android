@@ -137,9 +137,11 @@ fun MainScreen(viewModel: MainViewModel) {
         SettingsDialog(
             maxConnections = viewModel.maxConnections,
             speedLimitBps = viewModel.speedLimitBps,
+            uploadLimitBps = viewModel.uploadLimitBps,
             downloadDir = viewModel.downloadDir,
             onConnectionsChange = { viewModel.updateMaxConnections(it) },
             onSpeedLimitChange = { viewModel.updateSpeedLimitBps(it) },
+            onUploadLimitChange = { viewModel.updateUploadLimitBps(it) },
             onDismiss = { showSettings = false }
         )
     }
@@ -258,7 +260,11 @@ private fun DownloadTaskCard(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = "${task.state.name} · ${formatSpeed(task.speedBytesPerSec.toLong())}",
+                    text = if (task.kind == DownloadKind.TORRENT_MAGNET || task.kind == DownloadKind.TORRENT_FILE) {
+                        "${task.state.name} · ↓ ${formatSpeed(task.speedBytesPerSec.toLong())} · ↑ ${formatSpeed(task.uploadSpeedBytesPerSec.toLong())}"
+                    } else {
+                        "${task.state.name} · ${formatSpeed(task.speedBytesPerSec.toLong())}"
+                    },
                     style = MaterialTheme.typography.bodySmall
                 )
                 Row {
@@ -322,9 +328,11 @@ private fun formatSize(bytes: Long): String = when {
 private fun SettingsDialog(
     maxConnections: Int,
     speedLimitBps: Long,
+    uploadLimitBps: Long,
     downloadDir: String,
     onConnectionsChange: (Int) -> Unit,
     onSpeedLimitChange: (Long) -> Unit,
+    onUploadLimitChange: (Long) -> Unit,
     onDismiss: () -> Unit
 ) {
     val speedOptions = listOf(
@@ -373,6 +381,19 @@ private fun SettingsDialog(
                         }
                     }
                 }
+                Column {
+                    Text("上传限速（磁力做种）", style = MaterialTheme.typography.titleSmall)
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        speedOptions.forEach { (bps, label) ->
+                            FilterChip(
+                                selected = uploadLimitBps == bps,
+                                onClick = { onUploadLimitChange(bps) },
+                                label = { Text(label) }
+                            )
+                        }
+                    }
+                }
             }
         },
         confirmButton = {
@@ -380,4 +401,3 @@ private fun SettingsDialog(
         }
     )
 }
-
