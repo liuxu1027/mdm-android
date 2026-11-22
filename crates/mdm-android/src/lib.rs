@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::runtime::Runtime;
@@ -8,6 +9,8 @@ use uuid::Uuid;
 use mdm_engine::download::{Destination, Options, Request, State as EngineState};
 use mdm_torrent::{Config as TorrentConfig, Phase as TorrentPhase, Source, Torrents};
 
+mod hls;
+
 uniffi::setup_scaffolding!();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
@@ -15,6 +18,7 @@ pub enum DownloadKind {
     Http,
     TorrentMagnet,
     TorrentFile,
+    Hls,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
@@ -133,6 +137,7 @@ pub struct DownloadEngine {
     listener: ListenerSlot,
     http_handles: Arc<Mutex<HashMap<String, Arc<mdm_engine::download::Download>>>>,
     torrent_hashes: Arc<Mutex<HashMap<String, String>>>,
+    hls_cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     torrents: Arc<tokio::sync::Mutex<Option<Arc<Torrents>>>>,
     default_connections: Arc<Mutex<u32>>,
     speed_limit_bps: Arc<Mutex<u64>>,
@@ -165,6 +170,7 @@ impl DownloadEngine {
             listener: Arc::new(Mutex::new(None)),
             http_handles: Arc::new(Mutex::new(HashMap::new())),
             torrent_hashes: Arc::new(Mutex::new(HashMap::new())),
+            hls_cancels: Arc::new(Mutex::new(HashMap::new())),
             torrents: Arc::new(tokio::sync::Mutex::new(None)),
             default_connections: Arc::new(Mutex::new(8)),
             speed_limit_bps: Arc::new(Mutex::new(0)),
@@ -272,8 +278,65 @@ impl DownloadEngine {
         Ok(id)
     }
 
-    pub fn add_magnet_download(&self, magnet_uri: String) -> Result<String, MdmError> {
-        let src = Source::magnet(&magnet_uri).ok_or_else(|| MdmError::InvalidInput {
+    /// 下载 m3u8 视频：解析播放列表，分片下载并合并成一个 .ts 文件。
+    pub fn add_hls_download(
+        &self,
+        url: String,
+        filename: Option<String>,
+    ) -> Result<String, MdmError> {
+        let parsed = url::Url::parse(&url).map_err(|_| MdmError::InvalidInput {
+            reason: "无效的 URL".into(),
+        })?;
+        match parsed.scheme() {
+            "http" | "https" => {}
+            other => {
+                return Err(MdmError::InvalidInput {
+                    reason: format!("不支持的协议: {other}"),
+                })
+            }
+        }
+
+        let id = Uuid::new_v4().to_string();
+        let base_name = filename.unwrap_or_else(|| {
+            url.split('/')
+                .last()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("video")
+                .split('?')
+                .next()
+                .unwrap_or("video")
+                .to_string()
+        });
+        // 输出一定是 .ts（分片是 MPEG-TS 容器）；去掉原扩展名再加 .ts。
+        let stem = base_name
+            .rsplit_once('.')
+            .map(|(s, _)| s)
+            .unwrap_or(&base_name);
+        let resolved_name = format!("{stem}.ts");
+        let save_path = self.download_dir.join(&resolved_name);
+
+        let task = DownloadTask {
+            id: id.clone(),
+            title: resolved_name.clone(),
+            source_url: url.clone(),
+            save_path: save_path.to_string_lossy().to_string(),
+            kind: DownloadKind::Hls,
+            state: DownloadState::Downloading,
+            total_bytes: 0,
+            downloaded_bytes: 0,
+            speed_bytes_per_sec: 0,
+            active_connections: 0,
+            error_message: None,
+        };
+
+        self.insert_task(task);
+        log::info!("[HLS] 添加任务: {} -> {:?}", resolved_name, save_path);
+        self.run_hls(id.clone(), parsed, save_path);
+
+        Ok(id)
+    }
+
+    pub fn add_magnet_download(&self, magnet_uri: String) -> Result<String, MdmError> {        let src = Source::magnet(&magnet_uri).ok_or_else(|| MdmError::InvalidInput {
             reason: "Magnet link must start with magnet:?".into(),
         })?;
 
@@ -351,6 +414,13 @@ impl DownloadEngine {
                     }
                 }
             }
+            DownloadKind::Hls => {
+                if let Ok(map) = self.hls_cancels.lock() {
+                    if let Some(flag) = map.get(&id) {
+                        flag.store(true, Ordering::SeqCst);
+                    }
+                }
+            }
             _ => {
                 if let Some(hash) = self
                     .torrent_hashes
@@ -389,6 +459,17 @@ impl DownloadEngine {
                 let shown = task.downloaded_bytes;
                 self.update_state(&id, DownloadState::Downloading)?;
                 self.run_http(id, parsed, save_path, conns, true, shown);
+                Ok(())
+            }
+            DownloadKind::Hls => {
+                let parsed = url::Url::parse(&task.source_url).map_err(|_| MdmError::InvalidInput {
+                    reason: "无效的 URL".into(),
+                })?;
+                let save_path = PathBuf::from(&task.save_path);
+                // 分片下载不支持断点续传：删掉已下的部分，从头重新下载。
+                let _ = std::fs::remove_file(&save_path);
+                self.update_state(&id, DownloadState::Downloading)?;
+                self.run_hls(id, parsed, save_path);
                 Ok(())
             }
             _ => {
@@ -430,6 +511,15 @@ impl DownloadEngine {
                 let save_path = PathBuf::from(&task.save_path);
                 let _ = std::fs::remove_file(&save_path);
                 let _ = std::fs::remove_file(mdm_engine::state::state_path(&save_path));
+            }
+            DownloadKind::Hls => {
+                if let Ok(mut map) = self.hls_cancels.lock() {
+                    if let Some(flag) = map.remove(&id) {
+                        flag.store(true, Ordering::SeqCst);
+                    }
+                }
+                let save_path = PathBuf::from(&task.save_path);
+                let _ = std::fs::remove_file(&save_path);
             }
             _ => {
                 if let Some(hash) = self
@@ -608,6 +698,61 @@ impl DownloadEngine {
             }
             if let Ok(mut h) = handles.lock() {
                 h.remove(&task_id);
+            }
+        });
+    }
+
+    /// 下载一个 m3u8 视频：用上游打过补丁的 TLS 客户端拉播放列表和分片，
+    /// 进度直接写进任务列表。
+    fn run_hls(&self, task_id: String, url: url::Url, save_path: PathBuf) {
+        let tasks = Arc::clone(&self.tasks);
+        let listener = Arc::clone(&self.listener);
+        let cancels = Arc::clone(&self.hls_cancels);
+        let cancel = Arc::new(AtomicBool::new(false));
+        if let Ok(mut map) = cancels.lock() {
+            map.insert(task_id.clone(), Arc::clone(&cancel));
+        }
+        self.runtime.spawn(async move {
+            // 复用上游的 TLS 配置：Android 上走纯 Rust WebPKI 校验
+            //（rustls-platform-verifier 在这里永远初始化失败，见 #29）。
+            let client = match mdm_engine::tls::configure(reqwest::Client::builder())
+                .user_agent("MisterDownloadManager/1.0")
+                .build()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    fail_task(&tasks, &listener, &task_id, format!("创建网络客户端失败: {e}"));
+                    return;
+                }
+            };
+            let result = hls::download_hls(&client, url.as_str(), &save_path, &cancel, |downloaded, total, speed| {
+                update_task(&tasks, &listener, &task_id, |t| {
+                    t.downloaded_bytes = downloaded;
+                    t.total_bytes = total;
+                    t.speed_bytes_per_sec = speed;
+                });
+            })
+            .await;
+            match result {
+                Ok(()) => {
+                    update_task(&tasks, &listener, &task_id, |t| {
+                        t.state = DownloadState::Completed;
+                        t.speed_bytes_per_sec = 0;
+                    });
+                    log::info!("[HLS] 完成: {:?}", save_path);
+                }
+                Err(e) if e == hls::ERR_CANCELLED => {
+                    update_task(&tasks, &listener, &task_id, |t| {
+                        t.state = DownloadState::Paused;
+                        t.speed_bytes_per_sec = 0;
+                    });
+                }
+                Err(e) => {
+                    fail_task(&tasks, &listener, &task_id, e);
+                }
+            }
+            if let Ok(mut map) = cancels.lock() {
+                map.remove(&task_id);
             }
         });
     }
