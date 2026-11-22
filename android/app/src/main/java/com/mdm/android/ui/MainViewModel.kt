@@ -14,7 +14,6 @@ import com.mdm.android.service.EngineRegistry
 import kotlinx.coroutines.flow.StateFlow
 import uniffi.mdm_android.DownloadState
 import uniffi.mdm_android.DownloadTask
-import java.io.File
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     val tasks: StateFlow<List<DownloadTask>> = EngineRegistry.tasks
@@ -32,7 +31,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     /** 下载保存目录（只读展示）。 */
     val downloadDir: String =
-        File(application.getExternalFilesDir(null) ?: application.filesDir, "downloads").absolutePath
+        DownloadForegroundService.resolveDownloadDir(application).absolutePath
 
     fun ensureServiceStarted() {
         val ctx = getApplication<Application>()
