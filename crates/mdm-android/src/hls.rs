@@ -6,7 +6,7 @@
 //! VLC / MX Player 等播放。下载不走全局限速（走自己的 reqwest 客户端）。
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -16,7 +16,7 @@ use cbc::cipher::block_padding::Pkcs7;
 use cbc::cipher::{BlockDecryptMut, KeyIvInit};
 use cbc::Decryptor;
 use m3u8_rs::{KeyMethod, Playlist};
-use tokio::fs::File;
+use tokio::fs::{File, OpenOptions};
 use tokio::io::AsyncWriteExt;
 
 /// 取消时返回的错误文本，lib.rs 靠它把任务标成“已暂停”。
@@ -25,26 +25,35 @@ pub const ERR_CANCELLED: &str = "下载已取消";
 /// 同时下载的分片数。
 const PARALLEL_SEGMENTS: usize = 8;
 
+/// 断点续传进度文件：放在输出文件旁边，内容是三行：
+/// 播放列表地址、分片总数、已写完的分片数。
+/// 任务失败或取消时保留，下次继续时从这里接着下；
+/// 任务完成或删除时删掉。地址或总数对不上就从头开始。
+pub fn progress_path(out_path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.hlsprogress", out_path.display()))
+}
+
 fn is_cancelled(cancel: &Arc<AtomicBool>) -> bool {
     cancel.load(Ordering::Relaxed)
 }
 
 /// 请求带重试：IPFS 这类网关偶尔会中途断开，一个分片失败就整个任务失败；
-/// 每个请求最多试 3 次，失败后等 1 秒、2 秒再试。
+/// 每个请求最多试 5 次，失败后等 1 秒、2 秒、4 秒、8 秒再试。
 async fn fetch_bytes(
     client: &reqwest::Client,
     url: &str,
     range: Option<(u64, u64)>,
 ) -> Result<Vec<u8>, String> {
     let mut last_err = String::new();
-    for attempt in 1..=3 {
+    for attempt in 1..=5 {
         match fetch_bytes_once(client, url, range).await {
             Ok(b) => return Ok(b),
             Err(e) => {
                 last_err = e;
-                if attempt < 3 {
-                    log::warn!("[HLS] 请求失败，第 {attempt}/3 次重试 {url}: {last_err}");
-                    tokio::time::sleep(std::time::Duration::from_secs(attempt as u64)).await;
+                if attempt < 5 {
+                    let wait = 1u64 << (attempt - 1); // 1、2、4、8 秒
+                    log::warn!("[HLS] 请求失败，第 {attempt}/5 次重试 {url}: {last_err}（{wait} 秒后）");
+                    tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
                 }
             }
         }
@@ -254,14 +263,61 @@ pub async fn download_hls(
         });
     }
 
-    // 3. 逐块并行下载分片，顺序写入文件。
-    let mut out = File::create(out_path)
-        .await
-        .map_err(|e| format!("创建输出文件失败: {e}"))?;
+    // 3. 断点续传：上次失败/取消后，输出文件和进度文件都还在，
+    //    从上次写完的分片继续，不用从头再下。没有进度文件时从头开始。
+    let progress_file = progress_path(out_path);
+    let mut start_idx = 0usize;
     let mut downloaded: u64 = 0;
+    if let Ok(txt) = std::fs::read_to_string(&progress_file) {
+        let mut lines = txt.lines();
+        let url_ok = lines.next() == Some(playlist_url);
+        let count_ok = lines
+            .next()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            == Some(plans.len());
+        if url_ok && count_ok {
+            if let Some(Ok(n)) = lines.next().map(|s| s.trim().parse::<usize>()) {
+                if n >= plans.len() {
+                    // 上次已全部写完，只差收尾：直接算完成。
+                    let _ = std::fs::remove_file(&progress_file);
+                    return Ok(());
+                }
+                if n > 0 {
+                    if let Ok(meta) = std::fs::metadata(out_path) {
+                        if meta.len() > 0 {
+                            start_idx = n;
+                            downloaded = meta.len();
+                            log::info!(
+                                "[HLS] 断点续传：从第 {}/{} 分片继续（已有 {} 字节）",
+                                n,
+                                plans.len(),
+                                downloaded
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if start_idx == 0 {
+        let _ = std::fs::remove_file(&progress_file);
+    }
+    let mut out = if start_idx > 0 {
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(out_path)
+            .await
+            .map_err(|e| format!("打开输出文件失败: {e}"))?
+    } else {
+        File::create(out_path)
+            .await
+            .map_err(|e| format!("创建输出文件失败: {e}"))?
+    };
     let started = Instant::now();
+    let resume_base = downloaded; // 续传时已有字节不计入本次速度
 
-    for (chunk_idx, chunk) in plans.chunks(PARALLEL_SEGMENTS).enumerate() {
+    for (chunk_idx, chunk) in plans[start_idx..].chunks(PARALLEL_SEGMENTS).enumerate() {
         if is_cancelled(cancel) {
             return Err(ERR_CANCELLED.to_string());
         }
@@ -290,11 +346,22 @@ pub async fn download_hls(
                 .map_err(|e| format!("写入文件失败: {e}"))?;
             downloaded += data.len() as u64;
             let elapsed = started.elapsed().as_secs_f64().max(0.1);
-            on_progress(downloaded, total_bytes, (downloaded as f64 / elapsed) as u64);
+            on_progress(
+                downloaded,
+                total_bytes,
+                ((downloaded - resume_base) as f64 / elapsed) as u64,
+            );
         }
+        let done = start_idx + chunk_idx * PARALLEL_SEGMENTS + chunk.len();
+        // 每写完一块就记一次进度：这次失败的话，下次从这里继续。
+        let _ = tokio::fs::write(
+            &progress_file,
+            format!("{}\n{}\n{}", playlist_url, plans.len(), done),
+        )
+        .await;
         log::info!(
             "[HLS] 已写 {} / {} 分片（{} 字节）",
-            chunk_idx * PARALLEL_SEGMENTS + chunk.len(),
+            done,
             plans.len(),
             downloaded
         );
@@ -303,6 +370,7 @@ pub async fn download_hls(
     out.flush()
         .await
         .map_err(|e| format!("写入文件失败: {e}"))?;
+    let _ = std::fs::remove_file(&progress_file);
     log::info!("[HLS] 完成: {} 字节 -> {:?}", downloaded, out_path);
     Ok(())
 }
