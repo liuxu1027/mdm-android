@@ -29,7 +29,30 @@ fn is_cancelled(cancel: &Arc<AtomicBool>) -> bool {
     cancel.load(Ordering::Relaxed)
 }
 
+/// 请求带重试：IPFS 这类网关偶尔会中途断开，一个分片失败就整个任务失败；
+/// 每个请求最多试 3 次，失败后等 1 秒、2 秒再试。
 async fn fetch_bytes(
+    client: &reqwest::Client,
+    url: &str,
+    range: Option<(u64, u64)>,
+) -> Result<Vec<u8>, String> {
+    let mut last_err = String::new();
+    for attempt in 1..=3 {
+        match fetch_bytes_once(client, url, range).await {
+            Ok(b) => return Ok(b),
+            Err(e) => {
+                last_err = e;
+                if attempt < 3 {
+                    log::warn!("[HLS] 请求失败，第 {attempt}/3 次重试 {url}: {last_err}");
+                    tokio::time::sleep(std::time::Duration::from_secs(attempt as u64)).await;
+                }
+            }
+        }
+    }
+    Err(last_err)
+}
+
+async fn fetch_bytes_once(
     client: &reqwest::Client,
     url: &str,
     range: Option<(u64, u64)>,
