@@ -176,7 +176,7 @@ pub async fn download_hls(
         });
         let key = match &seg.key {
             Some(k) => match k.method {
-                KeyMethod::Aes128 => {
+                KeyMethod::AES128 => {
                     let key_uri = k
                         .uri
                         .clone()
