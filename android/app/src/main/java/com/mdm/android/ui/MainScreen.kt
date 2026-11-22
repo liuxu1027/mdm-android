@@ -45,6 +45,17 @@ fun MainScreen(viewModel: MainViewModel) {
     val context = LocalContext.current
     val hasActiveDownload = tasks.any { it.state == DownloadState.DOWNLOADING }
 
+    // 打开“所有文件访问权限”的系统设置页（特殊应用权限，不在应用详情的常规权限里）。
+    val openAllFilesAccess = {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val intent =
+                Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+                    data = Uri.parse("package:${context.packageName}")
+                }
+            context.startActivity(intent)
+        }
+    }
+
     // 没开“所有文件访问权限”时提示一次：不开的话下载只能存在应用私有目录，文件管理器看不到。
     LaunchedEffect(Unit) {
         val prefs = context.getSharedPreferences("mdm_settings", Context.MODE_PRIVATE)
@@ -147,6 +158,8 @@ fun MainScreen(viewModel: MainViewModel) {
             retryDelaySecs = viewModel.retryDelaySecs,
             retryAlways = viewModel.retryAlways,
             downloadDir = viewModel.downloadDir,
+            downloadLocation = viewModel.downloadLocation,
+            hasAllFilesAccess = DownloadForegroundService.hasAllFilesAccess(context),
             onConnectionsChange = { viewModel.updateMaxConnections(it) },
             onSpeedLimitChange = { viewModel.updateSpeedLimitBps(it) },
             onUploadLimitChange = { viewModel.updateUploadLimitBps(it) },
@@ -154,6 +167,8 @@ fun MainScreen(viewModel: MainViewModel) {
             onRetryMaxAttemptsChange = { viewModel.updateRetryMaxAttempts(it) },
             onRetryDelaySecsChange = { viewModel.updateRetryDelaySecs(it) },
             onRetryAlwaysChange = { viewModel.updateRetryAlways(it) },
+            onDownloadLocationChange = { viewModel.updateDownloadLocation(it) },
+            onOpenAllFilesAccess = openAllFilesAccess,
             onDismiss = { showSettings = false }
         )
     }
@@ -166,13 +181,7 @@ fun MainScreen(viewModel: MainViewModel) {
             confirmButton = {
                 TextButton(onClick = {
                     showStorageDialog = false
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                        val intent =
-                            Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
-                                data = Uri.parse("package:${context.packageName}")
-                            }
-                        context.startActivity(intent)
-                    }
+                    openAllFilesAccess()
                 }) { Text("去开启") }
             },
             dismissButton = {
@@ -346,6 +355,8 @@ private fun SettingsDialog(
     retryDelaySecs: Int,
     retryAlways: Boolean,
     downloadDir: String,
+    downloadLocation: String,
+    hasAllFilesAccess: Boolean,
     onConnectionsChange: (Int) -> Unit,
     onSpeedLimitChange: (Long) -> Unit,
     onUploadLimitChange: (Long) -> Unit,
@@ -353,6 +364,8 @@ private fun SettingsDialog(
     onRetryMaxAttemptsChange: (Int) -> Unit,
     onRetryDelaySecsChange: (Int) -> Unit,
     onRetryAlwaysChange: (Boolean) -> Unit,
+    onDownloadLocationChange: (String) -> Unit,
+    onOpenAllFilesAccess: () -> Unit,
     onDismiss: () -> Unit
 ) {
     val speedOptions = listOf(
@@ -374,6 +387,51 @@ private fun SettingsDialog(
                     Text("下载目录", style = MaterialTheme.typography.titleSmall)
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(downloadDir, style = MaterialTheme.typography.bodySmall)
+                }
+                Column {
+                    Text("下载位置", style = MaterialTheme.typography.titleSmall)
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        RadioButton(
+                            selected = downloadLocation == "public",
+                            onClick = { onDownloadLocationChange("public") }
+                        )
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("手机存储 Download/MDM", style = MaterialTheme.typography.bodyMedium)
+                            Text(
+                                "文件管理器直接能找到；需要所有文件访问权限",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        }
+                    }
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        RadioButton(
+                            selected = downloadLocation == "private",
+                            onClick = { onDownloadLocationChange("private") }
+                        )
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("应用私有目录", style = MaterialTheme.typography.bodyMedium)
+                            Text(
+                                "不需要权限，但文件管理器看不到",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        }
+                    }
+                    if (downloadLocation == "public" && !hasAllFilesAccess) {
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            "还没开启所有文件访问权限，现在下载会先存在应用私有目录。这个权限在“设置 - 应用 - 特殊应用权限 - 所有文件访问权限”里，不在应用详情的常规权限列表里，所以那边看着是灰的。",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        TextButton(onClick = onOpenAllFilesAccess) { Text("去开启权限") }
+                    }
+                    Text("切换后重启应用生效", style = MaterialTheme.typography.bodySmall)
                 }
                 Column {
                     Text(
