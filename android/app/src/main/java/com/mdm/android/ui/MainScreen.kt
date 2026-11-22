@@ -272,7 +272,7 @@ private fun DownloadTaskCard(
                         IconButton(onClick = onPause) {
                             Icon(Icons.Default.Pause, contentDescription = "暂停")
                         }
-                    } else if (task.state == DownloadState.PAUSED) {
+                    } else if (task.state == DownloadState.PAUSED || task.state == DownloadState.FAILED) {
                         IconButton(onClick = onResume) {
                             Icon(Icons.Default.PlayArrow, contentDescription = "继续")
                         }
