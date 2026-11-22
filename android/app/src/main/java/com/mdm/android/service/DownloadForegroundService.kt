@@ -30,6 +30,12 @@ class DownloadForegroundService : Service(), ProgressListener {
             setDefaultConnections(prefs.getInt("max_connections", 8).toUInt())
             setSpeedLimitBps(prefs.getLong("speed_limit_bps", 0L).toULong())
             setUploadLimitBps(prefs.getLong("upload_limit_bps", 0L).toULong())
+            setRetrySettings(
+                prefs.getBoolean("retry_enabled", true),
+                prefs.getInt("retry_max_attempts", 999999).toUInt(),
+                prefs.getInt("retry_delay_secs", 5).toUInt(),
+                prefs.getBoolean("retry_always", false)
+            )
             setListener(this@DownloadForegroundService)
         }
         EngineRegistry.attach(engine!!)
