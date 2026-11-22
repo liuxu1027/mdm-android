@@ -1,6 +1,11 @@
 package com.mdm.android.ui
 
 import android.app.Activity
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.Build
+import android.provider.Settings
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -31,8 +36,19 @@ fun MainScreen(viewModel: MainViewModel) {
     var showAddDialog by remember { mutableStateOf(false) }
     var showSettings by remember { mutableStateOf(false) }
     var showExitConfirm by remember { mutableStateOf(false) }
+    var showStorageDialog by remember { mutableStateOf(false) }
     val context = LocalContext.current
     val hasActiveDownload = tasks.any { it.state == DownloadState.DOWNLOADING }
+
+    // 没开“所有文件访问权限”时提示一次：不开的话下载只能存在应用私有目录，文件管理器看不到。
+    LaunchedEffect(Unit) {
+        val prefs = context.getSharedPreferences("mdm_settings", Context.MODE_PRIVATE)
+        if (!DownloadForegroundService.hasAllFilesAccess(context) &&
+            !prefs.getBoolean("storage_prompt_dismissed", false)
+        ) {
+            showStorageDialog = true
+        }
+    }
     val doExit = {
         viewModel.exit()
         (context as? Activity)?.finish()
@@ -124,6 +140,33 @@ fun MainScreen(viewModel: MainViewModel) {
             onConnectionsChange = { viewModel.updateMaxConnections(it) },
             onSpeedLimitChange = { viewModel.updateSpeedLimitBps(it) },
             onDismiss = { showSettings = false }
+        )
+    }
+
+    if (showStorageDialog) {
+        AlertDialog(
+            onDismissRequest = { showStorageDialog = false },
+            title = { Text("下载的文件存在哪") },
+            text = { Text("现在下载保存在应用私有目录，文件管理器看不到。建议去设置里开启“所有文件访问权限”，之后下载会保存到 Download/MDM，文件管理器里直接能找到。开启后重启应用生效。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    showStorageDialog = false
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        val intent =
+                            Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+                                data = Uri.parse("package:${context.packageName}")
+                            }
+                        context.startActivity(intent)
+                    }
+                }) { Text("去开启") }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    context.getSharedPreferences("mdm_settings", Context.MODE_PRIVATE)
+                        .edit().putBoolean("storage_prompt_dismissed", true).apply()
+                    showStorageDialog = false
+                }) { Text("以后再说") }
+            }
         )
     }
 
