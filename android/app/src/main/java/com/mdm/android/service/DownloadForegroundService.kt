@@ -49,6 +49,18 @@ class DownloadForegroundService : Service(), ProgressListener {
                     runCatching { engine?.addMagnetDownload(magnet) }
                 }
             }
+            ACTION_ADD_HLS -> {
+                val url = intent.getStringExtra(EXTRA_URL)
+                if (!url.isNullOrBlank()) {
+                    runCatching { engine?.addHlsDownload(url, null) }
+                }
+            }
+            ACTION_EXIT -> {
+                // 彻底退出：正在下载的任务会被停掉，通知栏随服务一起消失。
+                engine?.setListener(null)
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+            }
         }
         return START_STICKY
     }
@@ -91,6 +103,14 @@ class DownloadForegroundService : Service(), ProgressListener {
             Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE
         )
+        val exitIntent = PendingIntent.getService(
+            this,
+            0,
+            Intent(this, DownloadForegroundService::class.java).apply {
+                action = ACTION_EXIT
+            },
+            PendingIntent.FLAG_IMMUTABLE
+        )
         return NotificationCompat.Builder(this, MdmApplication.CHANNEL_DOWNLOADS)
             .setContentTitle("Mister Download Manager")
             .setContentText(content)
@@ -98,6 +118,7 @@ class DownloadForegroundService : Service(), ProgressListener {
             .setContentIntent(openIntent)
             .setOngoing(true)
             .setProgress(100, progress, indeterminate)
+            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "退出", exitIntent)
             .build()
     }
 
@@ -112,6 +133,8 @@ class DownloadForegroundService : Service(), ProgressListener {
         const val NOTIFICATION_ID = 1001
         const val ACTION_ADD_HTTP = "com.mdm.android.ADD_HTTP"
         const val ACTION_ADD_MAGNET = "com.mdm.android.ADD_MAGNET"
+        const val ACTION_ADD_HLS = "com.mdm.android.ADD_HLS"
+        const val ACTION_EXIT = "com.mdm.android.EXIT"
         const val EXTRA_URL = "extra_url"
     }
 }
