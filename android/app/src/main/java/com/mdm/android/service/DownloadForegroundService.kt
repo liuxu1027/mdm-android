@@ -29,6 +29,7 @@ class DownloadForegroundService : Service(), ProgressListener {
             val prefs = getSharedPreferences("mdm_settings", Context.MODE_PRIVATE)
             setDefaultConnections(prefs.getInt("max_connections", 8).toUInt())
             setSpeedLimitBps(prefs.getLong("speed_limit_bps", 0L).toULong())
+            setUploadLimitBps(prefs.getLong("upload_limit_bps", 0L).toULong())
             setListener(this@DownloadForegroundService)
         }
         EngineRegistry.attach(engine!!)
