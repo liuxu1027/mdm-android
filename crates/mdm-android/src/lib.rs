@@ -130,6 +130,26 @@ async fn get_torrent_session(
     Ok(session)
 }
 
+/// m3u8 出错自动重试的设置（对标 1DM 的重试设置）。
+#[derive(Clone, Copy)]
+struct RetrySettings {
+    enabled: bool,
+    max_attempts: u32, // 重试次数，0 = 无限
+    delay_secs: u64,   // 每次重试前的等待秒数
+    always: bool,      // 即使 0 字节失败（链接失效等）也重试
+}
+
+impl Default for RetrySettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_attempts: 999999,
+            delay_secs: 5,
+            always: false,
+        }
+    }
+}
+
 #[derive(uniffi::Object)]
 pub struct DownloadEngine {
     runtime: Runtime,
@@ -143,6 +163,7 @@ pub struct DownloadEngine {
     default_connections: Arc<Mutex<u32>>,
     speed_limit_bps: Arc<Mutex<u64>>,
     upload_limit_bps: Arc<Mutex<u64>>,
+    retry_settings: Arc<Mutex<RetrySettings>>,
 }
 
 #[uniffi::export]
@@ -177,6 +198,7 @@ impl DownloadEngine {
             default_connections: Arc::new(Mutex::new(8)),
             speed_limit_bps: Arc::new(Mutex::new(0)),
             upload_limit_bps: Arc::new(Mutex::new(0)),
+            retry_settings: Arc::new(Mutex::new(RetrySettings::default())),
         }))
     }
 
@@ -229,6 +251,20 @@ impl DownloadEngine {
                 session.set_upload_limit(limit);
             }
         });
+    }
+
+    /// m3u8 出错自动重试设置：enabled 开关；max_attempts 重试次数，0 = 无限；
+    /// delay_secs 每次重试前的等待秒数；always 为 false 时，还没下到任何字节
+    /// 就失败的（链接失效、地址不对）不重试。正在下载的任务下次重试时生效。
+    pub fn set_retry_settings(&self, enabled: bool, max_attempts: u32, delay_secs: u64, always: bool) {
+        if let Ok(mut guard) = self.retry_settings.lock() {
+            *guard = RetrySettings {
+                enabled,
+                max_attempts,
+                delay_secs,
+                always,
+            };
+        }
     }
 
     pub fn add_http_download(
@@ -728,6 +764,7 @@ impl DownloadEngine {
         let tasks = Arc::clone(&self.tasks);
         let listener = Arc::clone(&self.listener);
         let cancels = Arc::clone(&self.hls_cancels);
+        let retry_settings = Arc::clone(&self.retry_settings);
         let cancel = Arc::new(AtomicBool::new(false));
         if let Ok(mut map) = cancels.lock() {
             map.insert(task_id.clone(), Arc::clone(&cancel));
@@ -745,11 +782,9 @@ impl DownloadEngine {
                     return;
                 }
             };
-            // 出错自动重试：分片拉取失败（网关抖动）时先自己重试，
-            // 每次都靠断点续传进度文件从断的地方接着下；3 次都不行才标失败。
-            // 还没下到任何字节就失败的（链接失效、地址不对）不重试，立即报错。
-            const HLS_MAX_ATTEMPTS: u32 = 4; // 首次 + 3 次自动重试
-            const HLS_RETRY_DELAY_SECS: u64 = 30;
+            // 出错自动重试（设置里可改，默认开）：分片拉取失败（网关抖动）时先自己重试，
+            // 每次都靠断点续传进度文件从断的地方接着下；次数用完才标失败。
+            // “始终重试”关着时，还没下到任何字节就失败的（链接失效、地址不对）不重试。
             let mut attempt = 0u32;
             let result: Result<(), String> = loop {
                 attempt += 1;
@@ -768,19 +803,32 @@ impl DownloadEngine {
                 if e == hls::ERR_CANCELLED {
                     break Err(e);
                 }
+                let rs = retry_settings
+                    .lock()
+                    .map(|g| *g)
+                    .unwrap_or_default();
+                if !rs.enabled {
+                    break Err(e);
+                }
                 // 已下字节数（回调里写进任务了）：0 字节说明播放列表都没拉到，
-                // 多半是链接失效，重试也没用；有进度才值得等一会儿再试。
+                // 多半是链接失效；除非开了“始终重试”，否则不重试。
                 let downloaded = tasks
                     .lock()
                     .map(|map| map.get(&task_id).map(|t| t.downloaded_bytes).unwrap_or(0))
                     .unwrap_or(0);
-                if downloaded == 0 || attempt >= HLS_MAX_ATTEMPTS {
+                if downloaded == 0 && !rs.always {
+                    break Err(e);
+                }
+                // attempt 是已试的次数（含首次）：重试次数 = attempt - 1；
+                // max_attempts 为 0 表示无限。
+                if rs.max_attempts != 0 && attempt > rs.max_attempts {
                     break Err(e);
                 }
                 log::warn!(
-                    "[HLS] 第 {attempt} 次尝试失败（已下 {downloaded} 字节），{HLS_RETRY_DELAY_SECS} 秒后自动重试: {e}"
+                    "[HLS] 第 {attempt} 次尝试失败（已下 {downloaded} 字节），{} 秒后自动重试: {e}",
+                    rs.delay_secs
                 );
-                for _ in 0..HLS_RETRY_DELAY_SECS {
+                for _ in 0..rs.delay_secs {
                     if cancel.load(Ordering::Relaxed) {
                         break;
                     }
