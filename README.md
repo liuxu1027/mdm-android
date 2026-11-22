@@ -1,8 +1,10 @@
-# Mister Download Manager — Android Starter (HTTP/HTTPS + BT/Magnet)
+# Mister Download Manager for Android（非官方移植版）
 
-基于 [anefzaoui/misterdownloadmanager](https://github.com/anefzaoui/misterdownloadmanager) 的 Android 移植工程骨架，采用 **Rust (`mdm-engine` + `mdm-torrent`) + UniFFI + Kotlin Jetpack Compose** 架构。
+这是 [anefzaoui/misterdownloadmanager](https://github.com/anefzaoui/misterdownloadmanager) 的**非官方 Android 移植版**，与原作者无关，也不是官方发布的安卓版。
 
-> 本项目遵循上游 **GPL-3.0** 开源协议。
+下载引擎（Rust `mdm-engine` + `mdm-torrent`）来自上游；Android 界面（Kotlin Jetpack Compose）、UniFFI 桥接、后台保活等安卓适配是新写的；HLS 下载、断点续传、重试设置等是移植版后加的功能。
+
+本项目遵循 GPL-3.0 开源协议，见 [LICENSE](LICENSE)。
 
 ## 目录结构
 
