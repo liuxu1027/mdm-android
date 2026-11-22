@@ -7,6 +7,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
+import android.os.Environment
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import com.mdm.android.MainActivity
@@ -23,7 +24,7 @@ class DownloadForegroundService : Service(), ProgressListener {
 
     override fun onCreate() {
         super.onCreate()
-        val downloadDir = File(getExternalFilesDir(null) ?: filesDir, "downloads").apply { mkdirs() }
+        val downloadDir = resolveDownloadDir(this)
         engine = DownloadEngine(downloadDir.absolutePath).apply {
             val prefs = getSharedPreferences("mdm_settings", Context.MODE_PRIVATE)
             setDefaultConnections(prefs.getInt("max_connections", 8).toUInt())
@@ -136,5 +137,31 @@ class DownloadForegroundService : Service(), ProgressListener {
         const val ACTION_ADD_HLS = "com.mdm.android.ADD_HLS"
         const val ACTION_EXIT = "com.mdm.android.EXIT"
         const val EXTRA_URL = "extra_url"
+
+        /** 是否有“所有文件访问权限”（Android 11+）。 */
+        fun hasAllFilesAccess(context: Context): Boolean {
+            return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                Environment.isExternalStorageManager()
+            } else {
+                false
+            }
+        }
+
+        /**
+         * 下载保存目录：有所有文件访问权限时用公共 Download/MDM（文件管理器可见），
+         * 否则回落到应用私有目录，保证下载不断。
+         */
+        fun resolveDownloadDir(context: Context): File {
+            val dir = if (hasAllFilesAccess(context)) {
+                File(
+                    Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                    "MDM"
+                )
+            } else {
+                File(context.getExternalFilesDir(null) ?: context.filesDir, "downloads")
+            }
+            dir.mkdirs()
+            return dir
+        }
     }
 }
