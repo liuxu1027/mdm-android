@@ -9,6 +9,9 @@ import android.provider.Settings
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Clear
@@ -22,6 +25,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.mdm.android.service.DownloadForegroundService
@@ -138,10 +142,18 @@ fun MainScreen(viewModel: MainViewModel) {
             maxConnections = viewModel.maxConnections,
             speedLimitBps = viewModel.speedLimitBps,
             uploadLimitBps = viewModel.uploadLimitBps,
+            retryEnabled = viewModel.retryEnabled,
+            retryMaxAttempts = viewModel.retryMaxAttempts,
+            retryDelaySecs = viewModel.retryDelaySecs,
+            retryAlways = viewModel.retryAlways,
             downloadDir = viewModel.downloadDir,
             onConnectionsChange = { viewModel.updateMaxConnections(it) },
             onSpeedLimitChange = { viewModel.updateSpeedLimitBps(it) },
             onUploadLimitChange = { viewModel.updateUploadLimitBps(it) },
+            onRetryEnabledChange = { viewModel.updateRetryEnabled(it) },
+            onRetryMaxAttemptsChange = { viewModel.updateRetryMaxAttempts(it) },
+            onRetryDelaySecsChange = { viewModel.updateRetryDelaySecs(it) },
+            onRetryAlwaysChange = { viewModel.updateRetryAlways(it) },
             onDismiss = { showSettings = false }
         )
     }
@@ -329,10 +341,18 @@ private fun SettingsDialog(
     maxConnections: Int,
     speedLimitBps: Long,
     uploadLimitBps: Long,
+    retryEnabled: Boolean,
+    retryMaxAttempts: Int,
+    retryDelaySecs: Int,
+    retryAlways: Boolean,
     downloadDir: String,
     onConnectionsChange: (Int) -> Unit,
     onSpeedLimitChange: (Long) -> Unit,
     onUploadLimitChange: (Long) -> Unit,
+    onRetryEnabledChange: (Boolean) -> Unit,
+    onRetryMaxAttemptsChange: (Int) -> Unit,
+    onRetryDelaySecsChange: (Int) -> Unit,
+    onRetryAlwaysChange: (Boolean) -> Unit,
     onDismiss: () -> Unit
 ) {
     val speedOptions = listOf(
@@ -346,7 +366,10 @@ private fun SettingsDialog(
         onDismissRequest = onDismiss,
         title = { Text("设置") },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
                 Column {
                     Text("下载目录", style = MaterialTheme.typography.titleSmall)
                     Spacer(modifier = Modifier.height(4.dp))
@@ -393,6 +416,63 @@ private fun SettingsDialog(
                             )
                         }
                     }
+                }
+                Column {
+                    Text("重试设置（m3u8 视频）", style = MaterialTheme.typography.titleSmall)
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("出错重试", style = MaterialTheme.typography.bodyMedium)
+                            Text("下载出错时自动重试", style = MaterialTheme.typography.bodySmall)
+                        }
+                        Switch(checked = retryEnabled, onCheckedChange = onRetryEnabledChange)
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("始终重试", style = MaterialTheme.typography.bodyMedium)
+                            Text(
+                                "即使服务器错误无法恢复，也始终重试下载",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        }
+                        Switch(checked = retryAlways, onCheckedChange = onRetryAlwaysChange)
+                    }
+                    Text(
+                        "请注意：启用始终重试将导致过多的数据浪费和电量消耗",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = retryMaxAttempts.toString(),
+                        onValueChange = {
+                            val digits = it.filter { c -> c.isDigit() }
+                            onRetryMaxAttemptsChange(digits.toIntOrNull() ?: 0)
+                        },
+                        label = { Text("重试次数（0 代表无限）") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = retryDelaySecs.toString(),
+                        onValueChange = {
+                            val digits = it.filter { c -> c.isDigit() }
+                            onRetryDelaySecsChange(digits.toIntOrNull() ?: 0)
+                        },
+                        label = { Text("重试间隔（秒）") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
                 }
             }
         },
