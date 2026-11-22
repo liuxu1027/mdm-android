@@ -33,7 +33,7 @@ class DownloadForegroundService : Service(), ProgressListener {
             setRetrySettings(
                 prefs.getBoolean("retry_enabled", true),
                 prefs.getInt("retry_max_attempts", 999999).toUInt(),
-                prefs.getInt("retry_delay_secs", 5).toUInt(),
+                prefs.getInt("retry_delay_secs", 5).toULong(),
                 prefs.getBoolean("retry_always", false)
             )
             setListener(this@DownloadForegroundService)
@@ -155,11 +155,13 @@ class DownloadForegroundService : Service(), ProgressListener {
         }
 
         /**
-         * 下载保存目录：有所有文件访问权限时用公共 Download/MDM（文件管理器可见），
-         * 否则回落到应用私有目录，保证下载不断。
+         * 下载保存目录：选了“手机存储”且有所有文件访问权限时用公共 Download/MDM
+         * （文件管理器可见），否则回落到应用私有目录，保证下载不断。
          */
         fun resolveDownloadDir(context: Context): File {
-            val dir = if (hasAllFilesAccess(context)) {
+            val prefs = context.getSharedPreferences("mdm_settings", Context.MODE_PRIVATE)
+            val wantPublic = prefs.getString("download_location", "public") != "private"
+            val dir = if (wantPublic && hasAllFilesAccess(context)) {
                 File(
                     Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
                     "MDM"
