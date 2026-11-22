@@ -8,12 +8,26 @@ android {
     namespace = "com.mdm.android"
     compileSdk = 35
 
+    // 版本号跟随 GitHub Actions 构建序号自动递增（本地构建时为 1）
+    val runNumber = (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInt()
+
+    // 固定 release 签名：release.keystore 由 workflow 从 Secrets 解码出来，密码从环境变量读。
+    // 本地构建没有 keystore 时，assembleRelease 会在签名一步报错；assembleDebug 不受影响。
+    signingConfigs {
+        create("release") {
+            storeFile = file("release.keystore")
+            storePassword = System.getenv("KEYSTORE_PASSWORD")
+            keyAlias = System.getenv("KEY_ALIAS")
+            keyPassword = System.getenv("KEY_PASSWORD")
+        }
+    }
+
     defaultConfig {
         applicationId = "com.mdm.android"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = runNumber
+        versionName = "0.1.$runNumber"
 
         ndk {
             abiFilters += listOf("arm64-v8a")
@@ -22,6 +36,7 @@ android {
 
     buildTypes {
         release {
+            signingConfig = signingConfigs.getByName("release")
             isMinifyEnabled = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
