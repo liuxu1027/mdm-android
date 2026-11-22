@@ -60,14 +60,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val trimmed = rawInput.trim()
         if (trimmed.isEmpty()) return
         val ctx = getApplication<Application>()
-        val action = if (trimmed.startsWith("magnet:?")) {
-            DownloadForegroundService.ACTION_ADD_MAGNET
-        } else {
-            DownloadForegroundService.ACTION_ADD_HTTP
+        val action = when {
+            trimmed.startsWith("magnet:?") -> DownloadForegroundService.ACTION_ADD_MAGNET
+            trimmed.substringBefore("?").endsWith(".m3u8", ignoreCase = true) ->
+                DownloadForegroundService.ACTION_ADD_HLS
+            else -> DownloadForegroundService.ACTION_ADD_HTTP
         }
         val intent = Intent(ctx, DownloadForegroundService::class.java).apply {
             this.action = action
             putExtra(DownloadForegroundService.EXTRA_URL, trimmed)
+        }
+        ContextCompat.startForegroundService(ctx, intent)
+    }
+
+    /** 彻底退出：停掉下载服务、去掉通知栏，界面随后关闭。 */
+    fun exit() {
+        val ctx = getApplication<Application>()
+        val intent = Intent(ctx, DownloadForegroundService::class.java).apply {
+            action = DownloadForegroundService.ACTION_EXIT
         }
         ContextCompat.startForegroundService(ctx, intent)
     }
