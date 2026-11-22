@@ -41,6 +41,7 @@ pub struct DownloadTask {
     pub total_bytes: u64,
     pub downloaded_bytes: u64,
     pub speed_bytes_per_sec: u64,
+    pub upload_speed_bytes_per_sec: u64,
     pub active_connections: u32,
     pub error_message: Option<String>,
 }
@@ -141,6 +142,7 @@ pub struct DownloadEngine {
     torrents: Arc<tokio::sync::Mutex<Option<Arc<Torrents>>>>,
     default_connections: Arc<Mutex<u32>>,
     speed_limit_bps: Arc<Mutex<u64>>,
+    upload_limit_bps: Arc<Mutex<u64>>,
 }
 
 #[uniffi::export]
@@ -174,6 +176,7 @@ impl DownloadEngine {
             torrents: Arc::new(tokio::sync::Mutex::new(None)),
             default_connections: Arc::new(Mutex::new(8)),
             speed_limit_bps: Arc::new(Mutex::new(0)),
+            upload_limit_bps: Arc::new(Mutex::new(0)),
         }))
     }
 
@@ -208,6 +211,22 @@ impl DownloadEngine {
             let guard = slot.lock().await;
             if let Some(session) = guard.as_ref() {
                 session.set_download_limit(limit);
+            }
+        });
+    }
+
+    /// Global upload limit in bytes/s for torrents (seeding), 0 = unlimited.
+    /// Applies to the running BT session at once; also applied when a torrent starts.
+    pub fn set_upload_limit_bps(&self, bps: u64) {
+        if let Ok(mut guard) = self.upload_limit_bps.lock() {
+            *guard = bps;
+        }
+        let limit = if bps == 0 { None } else { Some(bps) };
+        let slot = Arc::clone(&self.torrents);
+        self.runtime.spawn(async move {
+            let guard = slot.lock().await;
+            if let Some(session) = guard.as_ref() {
+                session.set_upload_limit(limit);
             }
         });
     }
@@ -466,8 +485,8 @@ impl DownloadEngine {
                     reason: "无效的 URL".into(),
                 })?;
                 let save_path = PathBuf::from(&task.save_path);
-                // 分片下载不支持断点续传：删掉已下的部分，从头重新下载。
-                let _ = std::fs::remove_file(&save_path);
+                // 分片下载支持断点续传：保留已下的部分和进度文件，
+                // 从上次断的地方继续（见 hls::progress_path）。
                 self.update_state(&id, DownloadState::Downloading)?;
                 self.run_hls(id, parsed, save_path);
                 Ok(())
@@ -520,6 +539,7 @@ impl DownloadEngine {
                 }
                 let save_path = PathBuf::from(&task.save_path);
                 let _ = std::fs::remove_file(&save_path);
+                let _ = std::fs::remove_file(hls::progress_path(&save_path));
             }
             _ => {
                 if let Some(hash) = self
@@ -764,6 +784,8 @@ impl DownloadEngine {
         let hashes = Arc::clone(&self.torrent_hashes);
         let slot = Arc::clone(&self.torrents);
         let download_dir = self.download_dir.clone();
+        let dl_limit = Arc::clone(&self.speed_limit_bps);
+        let ul_limit = Arc::clone(&self.upload_limit_bps);
 
         self.runtime.spawn(async move {
             let session = match get_torrent_session(&slot, &download_dir).await {
@@ -774,6 +796,15 @@ impl DownloadEngine {
                     return;
                 }
             };
+
+            // 刚启动的会话也要套用已存的上下行限速
+            //（set_*_limit_bps 只对调用时已存在的会话生效）。
+            {
+                let dl = dl_limit.lock().map(|g| *g).unwrap_or(0);
+                let ul = ul_limit.lock().map(|g| *g).unwrap_or(0);
+                session.set_download_limit(if dl == 0 { None } else { Some(dl) });
+                session.set_upload_limit(if ul == 0 { None } else { Some(ul) });
+            }
 
             log::info!("正在获取种子信息…");
             let meta = match session
@@ -837,6 +868,7 @@ impl DownloadEngine {
                             t.downloaded_bytes = stats.done;
                             t.total_bytes = stats.total;
                             t.speed_bytes_per_sec = stats.down_speed as u64;
+                            t.upload_speed_bytes_per_sec = stats.up_speed as u64;
                             t.active_connections = stats.peers_live as u32;
                             if let Some(state) = terminal {
                                 t.state = state;
