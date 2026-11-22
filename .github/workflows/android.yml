@@ -5,7 +5,9 @@ on:
     branches: ["main", "master"]
   workflow_dispatch:
 
-jobs:
+permissions:
+  contents: write
+  jobs:
   build-apk:
     runs-on: ubuntu-latest
     steps:
@@ -71,3 +73,11 @@ jobs:
         with:
           name: mdm-android-release-apk
           path: android/app/build/outputs/apk/release/*.apk
+
+
+      - name: Publish Release
+      uses: softprops/action-gh-release@v2
+      with:
+      tag_name: v0.1.${{ github.run_number }}
+      name: mdm v0.1.${{ github.run_number }}
+      files: android/app/build/outputs/apk/release/*.apk
