@@ -82,6 +82,27 @@ fn seq_iv(seq: u64) -> [u8; 16] {
     iv
 }
 
+/// 有些站点的密钥地址返回的是 32 个十六进制字符（ppnix 就是）而不是原始 16 字节，
+/// 遇到就转成 16 字节；标准站点直接返回 16 字节的保持原样。
+fn normalize_key(b: Vec<u8>) -> Result<Vec<u8>, String> {
+    if b.len() == 16 {
+        return Ok(b);
+    }
+    if b.len() == 32 && b.iter().all(|c| c.is_ascii_hexdigit()) {
+        let s = std::str::from_utf8(&b).map_err(|_| "密钥不是合法的十六进制".to_string())?;
+        return (0..16)
+            .map(|i| {
+                u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
+                    .map_err(|_| "密钥不是合法的十六进制".to_string())
+            })
+            .collect();
+    }
+    Err(format!(
+        "密钥长度错误（应为 16 字节或 32 个十六进制字符）：{} 字节",
+        b.len()
+    ))
+}
+
 fn decrypt_aes128(key: &[u8], iv: &[u8; 16], mut data: Vec<u8>) -> Result<Vec<u8>, String> {
     if key.len() != 16 {
         return Err(format!("密钥长度错误（应为 16 字节）：{} 字节", key.len()));
@@ -186,6 +207,7 @@ pub async fn download_hls(
                         Some(b) => b.clone(),
                         None => {
                             let b = fetch_bytes(client, &key_url, None).await?;
+                            let b = normalize_key(b)?;
                             key_cache.insert(key_url, b.clone());
                             b
                         }
