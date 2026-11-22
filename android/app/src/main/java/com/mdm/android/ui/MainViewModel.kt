@@ -55,6 +55,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         EngineRegistry.engine?.setSpeedLimitBps(v.toULong())
     }
 
+    /** 全局上传限速 bytes/s，0 = 不限速（只对磁力做种上传生效）。 */
+    var uploadLimitBps by mutableLongStateOf(prefs.getLong("upload_limit_bps", 0L))
+        private set
+
+    fun updateUploadLimitBps(value: Long) {
+        val v = value.coerceAtLeast(0L)
+        uploadLimitBps = v
+        prefs.edit().putLong("upload_limit_bps", v).apply()
+        EngineRegistry.engine?.setUploadLimitBps(v.toULong())
+    }
+
     fun addLink(rawInput: String) {
         val trimmed = rawInput.trim()
         if (trimmed.isEmpty()) return
