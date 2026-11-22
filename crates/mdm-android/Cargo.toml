@@ -26,6 +26,14 @@ android_logger = "0.14"
 url = "2"
 http = "1"
 
+# HLS (m3u8) 下载用：reqwest 走上游打过补丁的 TLS 配置（mdm_engine::tls::configure），
+# 版本须与上游一致（0.13.5），否则类型对不上。
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
+m3u8-rs = "6"
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+futures = "0.3"
+
 # Patch librqbit to use the fork with custom APIs (PieceOrder, MetadataProgress, PeerFilter, etc.)
 # required by mdm-torrent. Copied from upstream Cargo.toml [patch.crates-io].
 [patch.crates-io]
