@@ -81,7 +81,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         EngineRegistry.engine?.setRetrySettings(
             retryEnabled,
             retryMaxAttempts.toUInt(),
-            retryDelaySecs.toUInt(),
+            retryDelaySecs.toULong(),
             retryAlways
         )
     }
@@ -110,6 +110,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         retryAlways = value
         prefs.edit().putBoolean("retry_always", value).apply()
         applyRetrySettings()
+    }
+
+    /** 下载位置选择：public = 手机存储 Download/MDM，private = 应用私有目录。 */
+    var downloadLocation by mutableStateOf(prefs.getString("download_location", "public") ?: "public")
+        private set
+
+    fun updateDownloadLocation(value: String) {
+        val v = if (value == "private") "private" else "public"
+        downloadLocation = v
+        prefs.edit().putString("download_location", v).apply()
     }
 
     fun addLink(rawInput: String) {
