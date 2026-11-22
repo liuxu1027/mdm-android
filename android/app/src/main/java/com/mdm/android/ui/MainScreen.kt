@@ -1,5 +1,6 @@
 package com.mdm.android.ui
 
+import android.app.Activity
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -7,6 +8,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.ExitToApp
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Settings
@@ -14,6 +16,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import uniffi.mdm_android.DownloadKind
@@ -27,6 +30,13 @@ fun MainScreen(viewModel: MainViewModel) {
     var selectedTab by remember { mutableIntStateOf(0) }
     var showAddDialog by remember { mutableStateOf(false) }
     var showSettings by remember { mutableStateOf(false) }
+    var showExitConfirm by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    val hasActiveDownload = tasks.any { it.state == DownloadState.DOWNLOADING }
+    val doExit = {
+        viewModel.exit()
+        (context as? Activity)?.finish()
+    }
 
     val filteredTasks = remember(tasks, selectedTab) {
         when (selectedTab) {
@@ -52,6 +62,11 @@ fun MainScreen(viewModel: MainViewModel) {
                     IconButton(onClick = { showSettings = true }) {
                         Icon(Icons.Default.Settings, contentDescription = "设置")
                     }
+                    IconButton(onClick = {
+                        if (hasActiveDownload) showExitConfirm = true else doExit()
+                    }) {
+                        Icon(Icons.Default.ExitToApp, contentDescription = "退出")
+                    }
                 }
             )
         },
@@ -65,12 +80,12 @@ fun MainScreen(viewModel: MainViewModel) {
             TabRow(selectedTabIndex = selectedTab) {
                 Tab(selected = selectedTab == 0, onClick = { selectedTab = 0 }, text = { Text("全部") })
                 Tab(selected = selectedTab == 1, onClick = { selectedTab = 1 }, text = { Text("HTTP/HTTPS") })
-                Tab(selected = selectedTab == 2, onClick = { selectedTab = 2 }, text = { Text("BT / 磁力") })
+                Tab(selected = selectedTab == 2, onClick = { selectedTab = 2 }, text = { Text("磁力 / 视频") })
             }
 
             if (filteredTasks.isEmpty()) {
                 Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Text("点击右下角 + 添加 HTTP 链接或磁力链接", style = MaterialTheme.typography.bodyMedium)
+                    Text("点击右下角 + 添加 HTTP、磁力或 m3u8 视频链接", style = MaterialTheme.typography.bodyMedium)
                 }
             } else {
                 LazyColumn(
@@ -111,6 +126,23 @@ fun MainScreen(viewModel: MainViewModel) {
             onDismiss = { showSettings = false }
         )
     }
+
+    if (showExitConfirm) {
+        AlertDialog(
+            onDismissRequest = { showExitConfirm = false },
+            title = { Text("退出 MDM") },
+            text = { Text("有下载正在进行，退出会停止这些下载，确定退出吗？") },
+            confirmButton = {
+                TextButton(onClick = {
+                    showExitConfirm = false
+                    doExit()
+                }) { Text("退出") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showExitConfirm = false }) { Text("取消") }
+            }
+        )
+    }
 }
 
 @Composable
@@ -146,6 +178,7 @@ private fun DownloadTaskCard(
                                 DownloadKind.HTTP -> "HTTP"
                                 DownloadKind.TORRENT_MAGNET -> "Magnet"
                                 DownloadKind.TORRENT_FILE -> "Torrent"
+                                DownloadKind.HLS -> "视频"
                             }
                         )
                     }
@@ -213,7 +246,7 @@ private fun AddLinkDialog(onDismiss: () -> Unit, onConfirm: (String) -> Unit) {
             OutlinedTextField(
                 value = text,
                 onValueChange = { text = it },
-                label = { Text("输入 HTTP/HTTPS 或 magnet:? 链接") },
+                label = { Text("输入 HTTP/HTTPS、magnet:? 或 .m3u8 链接") },
                 singleLine = false,
                 maxLines = 4
             )
