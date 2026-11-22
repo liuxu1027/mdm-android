@@ -76,9 +76,9 @@ jobs:
           path: android/app/build/outputs/apk/release/*.apk
 
 
-    - name: Publish Release
+      - name: Publish Release
         uses: softprops/action-gh-release@v2
-      with:
+        with:
           tag_name: v0.1.${{ github.run_number }}
           name: mdm v0.1.${{ github.run_number }}
           files: android/app/build/outputs/apk/release/*.apk
