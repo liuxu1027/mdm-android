@@ -430,9 +430,19 @@ pub async fn download_hls(
                     downloaded += data.len() as u64;
                     next_to_write += 1;
                     let elapsed = started.elapsed().as_secs_f64().max(0.1);
+                    // 总大小：主播放列表给了码率时用“码率×总时长”；直接贴媒体列表
+                    // 没有码率时，用“已下字节÷已下分片×总分片”估算——分片大小越均匀
+                    // 估得越准，越到后面越准；还没下完任何分片时传 0 表示未知。
+                    let est_total = if total_bytes > 0 {
+                        total_bytes
+                    } else if next_to_write > 0 {
+                        downloaded * plans.len() as u64 / next_to_write as u64
+                    } else {
+                        0
+                    };
                     on_progress(
                         downloaded,
-                        total_bytes,
+                        est_total,
                         ((downloaded - resume_base) as f64 / elapsed) as u64,
                     );
                     // 每写完 parallel_segments 个或全部写完时记一次进度：这次失败的话，下次从这里继续。
