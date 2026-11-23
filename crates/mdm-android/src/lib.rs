@@ -551,7 +551,9 @@ impl DownloadEngine {
         }
     }
 
-    pub fn remove_task(&self, id: String) -> Result<(), MdmError> {
+    /// 从列表移除任务。delete_files=true 时同时删掉磁盘上的文件
+    /// （HTTP 的断点续传状态、HLS 的进度文件也一起删）；false 只从列表移除，文件留着。
+    pub fn remove_task(&self, id: String, delete_files: bool) -> Result<(), MdmError> {
         let removed = self
             .tasks
             .lock()
@@ -566,10 +568,12 @@ impl DownloadEngine {
                         dl.cancel();
                     }
                 }
-                // Best effort: drop the partial file and its resume state.
-                let save_path = PathBuf::from(&task.save_path);
-                let _ = std::fs::remove_file(&save_path);
-                let _ = std::fs::remove_file(mdm_engine::state::state_path(&save_path));
+                if delete_files {
+                    // Best effort: drop the partial file and its resume state.
+                    let save_path = PathBuf::from(&task.save_path);
+                    let _ = std::fs::remove_file(&save_path);
+                    let _ = std::fs::remove_file(mdm_engine::state::state_path(&save_path));
+                }
             }
             DownloadKind::Hls => {
                 if let Ok(mut map) = self.hls_cancels.lock() {
@@ -577,9 +581,11 @@ impl DownloadEngine {
                         flag.store(true, Ordering::SeqCst);
                     }
                 }
-                let save_path = PathBuf::from(&task.save_path);
-                let _ = std::fs::remove_file(&save_path);
-                let _ = std::fs::remove_file(hls::progress_path(&save_path));
+                if delete_files {
+                    let save_path = PathBuf::from(&task.save_path);
+                    let _ = std::fs::remove_file(&save_path);
+                    let _ = std::fs::remove_file(hls::progress_path(&save_path));
+                }
             }
             _ => {
                 if let Some(hash) = self
@@ -592,7 +598,7 @@ impl DownloadEngine {
                     let download_dir = self.download_dir.clone();
                     self.runtime.spawn(async move {
                         if let Ok(session) = get_torrent_session(&slot, &download_dir).await {
-                            let _ = session.remove(&hash, false).await;
+                            let _ = session.remove(&hash, delete_files).await;
                         }
                     });
                 }
