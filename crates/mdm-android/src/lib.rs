@@ -601,19 +601,42 @@ impl DownloadEngine {
                 Ok(())
             }
             _ => {
-                if let Some(hash) = self
+                let hash_opt = self
                     .torrent_hashes
                     .lock()
                     .map(|map| map.get(&id).cloned())
-                    .unwrap_or(None)
-                {
-                    let slot = Arc::clone(&self.torrents);
-                    let download_dir = self.download_dir.clone();
-                    self.runtime.spawn(async move {
-                        if let Ok(session) = get_torrent_session(&slot, &download_dir).await {
-                            let _ = session.resume(&hash).await;
+                    .unwrap_or(None);
+                match hash_opt {
+                    Some(hash) => {
+                        let slot = Arc::clone(&self.torrents);
+                        let download_dir = self.download_dir.clone();
+                        self.runtime.spawn(async move {
+                            if let Ok(session) = get_torrent_session(&slot, &download_dir).await {
+                                let _ = session.resume(&hash).await;
+                            }
+                        });
+                    }
+                    None => {
+                        // 重启后恢复的磁力/种子任务：会话里的哈希记录已丢，
+                        // 按存的链接重新加入会话，librqbit 会校验已下载的部分接着下。
+                        let source_url = task.source_url.clone();
+                        let kind = task.kind;
+                        let src_opt = match kind {
+                            DownloadKind::TorrentMagnet => Source::magnet(&source_url),
+                            DownloadKind::TorrentFile => {
+                                std::fs::read(&source_url).ok().map(Source::File)
+                            }
+                            _ => None,
+                        };
+                        match src_opt {
+                            Some(src) => self.run_torrent(id.clone(), src),
+                            None => {
+                                return Err(MdmError::InvalidInput {
+                                    reason: "无法恢复种子任务：链接无效".into(),
+                                })
+                            }
                         }
-                    });
+                    }
                 }
                 self.update_state(&id, DownloadState::Downloading)
             }
@@ -682,6 +705,24 @@ impl DownloadEngine {
             .lock()
             .map(|map| map.values().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// 启动时恢复一条已保存的任务记录：只插回列表，不启动下载。
+    /// 正在下载中的任务恢复为已暂停，由用户点“继续”再下；
+    /// 已完成 / 失败的保持原状态。
+    pub fn restore_task(&self, task: DownloadTask) -> Result<(), MdmError> {
+        let mut task = task;
+        if matches!(
+            task.state,
+            DownloadState::Downloading | DownloadState::Queued
+        ) {
+            task.state = DownloadState::Paused;
+        }
+        task.speed_bytes_per_sec = 0;
+        task.upload_speed_bytes_per_sec = 0;
+        task.active_connections = 0;
+        self.insert_task(task);
+        Ok(())
     }
 }
 
