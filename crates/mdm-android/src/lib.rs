@@ -150,6 +150,45 @@ impl Default for RetrySettings {
     }
 }
 
+/// 文件名去重：目标文件已存在时，在扩展名前加 4 个随机小写字母
+/// （比如 index.ts → index_kxqd.ts），避免后下的把先下完的顶掉。
+/// 随机字母来自 UUID，不用再加依赖。
+fn unique_path(dir: &Path, name: &str) -> PathBuf {
+    let mut path = dir.join(name);
+    if !path.exists() {
+        return path;
+    }
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{e}")),
+        _ => (name.to_string(), String::new()),
+    };
+    loop {
+        let letters: String = Uuid::new_v4()
+            .as_bytes()
+            .iter()
+            .take(4)
+            .map(|b| (b'a' + (b % 26)) as char)
+            .collect();
+        path = dir.join(format!("{stem}_{letters}{ext}"));
+        if !path.exists() {
+            return path;
+        }
+    }
+}
+
+/// 用户填的文件名：去掉路径分隔符（否则会跑出下载目录），空的按 None 处理。
+fn clean_filename(filename: Option<String>) -> Option<String> {
+    filename.and_then(|f| {
+        let cleaned: String = f.chars().filter(|c| !matches!(c, '/' | '\\')).collect();
+        let cleaned = cleaned.trim().to_string();
+        if cleaned.is_empty() {
+            None
+        } else {
+            Some(cleaned)
+        }
+    })
+}
+
 #[derive(uniffi::Object)]
 pub struct DownloadEngine {
     runtime: Runtime,
@@ -164,6 +203,7 @@ pub struct DownloadEngine {
     speed_limit_bps: Arc<Mutex<u64>>,
     upload_limit_bps: Arc<Mutex<u64>>,
     retry_settings: Arc<Mutex<RetrySettings>>,
+    remove_ads: Arc<Mutex<bool>>,
 }
 
 #[uniffi::export]
@@ -199,6 +239,7 @@ impl DownloadEngine {
             speed_limit_bps: Arc::new(Mutex::new(0)),
             upload_limit_bps: Arc::new(Mutex::new(0)),
             retry_settings: Arc::new(Mutex::new(RetrySettings::default())),
+            remove_ads: Arc::new(Mutex::new(false)),
         }))
     }
 
@@ -267,6 +308,14 @@ impl DownloadEngine {
         }
     }
 
+    /// m3u8 去广告：下载时同一列表拉两次，两次不一样的分片就是动态插进去
+    /// 的广告，跳过不下。默认关。正在下载的任务下次开始时生效。
+    pub fn set_remove_ads(&self, enabled: bool) {
+        if let Ok(mut guard) = self.remove_ads.lock() {
+            *guard = enabled;
+        }
+    }
+
     pub fn add_http_download(
         &self,
         url: String,
@@ -286,7 +335,7 @@ impl DownloadEngine {
         }
 
         let id = Uuid::new_v4().to_string();
-        let resolved_name = filename.unwrap_or_else(|| {
+        let resolved_name = clean_filename(filename).unwrap_or_else(|| {
             url.split('/')
                 .last()
                 .filter(|s| !s.is_empty())
@@ -296,7 +345,12 @@ impl DownloadEngine {
                 .unwrap_or("download.bin")
                 .to_string()
         });
-        let save_path = self.download_dir.join(&resolved_name);
+        // 同名文件已存在时加随机字母，避免后下的把先下完的顶掉。
+        let save_path = unique_path(&self.download_dir, &resolved_name);
+        let display_name = save_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or(resolved_name);
 
         let conns = if connections == 0 {
             self.default_connections
@@ -309,7 +363,7 @@ impl DownloadEngine {
 
         let task = DownloadTask {
             id: id.clone(),
-            title: resolved_name.clone(),
+            title: display_name,
             source_url: url.clone(),
             save_path: save_path.to_string_lossy().to_string(),
             kind: DownloadKind::Http,
@@ -353,7 +407,7 @@ impl DownloadEngine {
         }
 
         let id = Uuid::new_v4().to_string();
-        let base_name = filename.unwrap_or_else(|| {
+        let base_name = clean_filename(filename).unwrap_or_else(|| {
             url.split('/')
                 .last()
                 .filter(|s| !s.is_empty())
@@ -369,11 +423,16 @@ impl DownloadEngine {
             .map(|(s, _)| s)
             .unwrap_or(&base_name);
         let resolved_name = format!("{stem}.ts");
-        let save_path = self.download_dir.join(&resolved_name);
+        // 同名文件已存在时加随机字母，避免后下的把先下完的顶掉。
+        let save_path = unique_path(&self.download_dir, &resolved_name);
+        let display_name = save_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or(resolved_name);
 
         let task = DownloadTask {
             id: id.clone(),
-            title: resolved_name.clone(),
+            title: display_name,
             source_url: url.clone(),
             save_path: save_path.to_string_lossy().to_string(),
             kind: DownloadKind::Hls,
@@ -775,6 +834,7 @@ impl DownloadEngine {
         let listener = Arc::clone(&self.listener);
         let cancels = Arc::clone(&self.hls_cancels);
         let retry_settings = Arc::clone(&self.retry_settings);
+        let remove_ads = Arc::clone(&self.remove_ads);
         let cancel = Arc::new(AtomicBool::new(false));
         if let Ok(mut map) = cancels.lock() {
             map.insert(task_id.clone(), Arc::clone(&cancel));
@@ -795,6 +855,8 @@ impl DownloadEngine {
             // 出错自动重试（设置里可改，默认开）：分片拉取失败（网关抖动）时先自己重试，
             // 每次都靠断点续传进度文件从断的地方接着下；次数用完才标失败。
             // “始终重试”关着时，还没下到任何字节就失败的（链接失效、地址不对）不重试。
+            // 去广告开关读一次，整次下载（包括重试）都用这个值。
+            let remove_ads = remove_ads.lock().map(|g| *g).unwrap_or(false);
             let mut attempt = 0u32;
             let result: Result<(), String> = loop {
                 attempt += 1;
@@ -804,7 +866,7 @@ impl DownloadEngine {
                         t.total_bytes = total;
                         t.speed_bytes_per_sec = speed;
                     });
-                })
+                }, remove_ads)
                 .await;
                 if r.is_ok() {
                     break r;
