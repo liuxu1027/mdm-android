@@ -156,13 +156,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         runCatching { EngineRegistry.engine?.resumeTask(id) }
     }
 
-    fun remove(id: String) {
-        runCatching { EngineRegistry.engine?.removeTask(id) }
+    fun remove(id: String, deleteFiles: Boolean) {
+        runCatching { EngineRegistry.engine?.removeTask(id, deleteFiles) }
     }
 
     fun clearFinished() {
         tasks.value
             .filter { it.state == DownloadState.COMPLETED || it.state == DownloadState.FAILED }
-            .forEach { remove(it.id) }
+            .forEach { remove(it.id, false) }
     }
 }
