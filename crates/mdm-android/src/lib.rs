@@ -204,6 +204,7 @@ pub struct DownloadEngine {
     upload_limit_bps: Arc<Mutex<u64>>,
     retry_settings: Arc<Mutex<RetrySettings>>,
     remove_ads: Arc<Mutex<bool>>,
+    hls_parallel_segments: Arc<Mutex<u32>>,
 }
 
 #[uniffi::export]
@@ -240,6 +241,7 @@ impl DownloadEngine {
             upload_limit_bps: Arc::new(Mutex::new(0)),
             retry_settings: Arc::new(Mutex::new(RetrySettings::default())),
             remove_ads: Arc::new(Mutex::new(false)),
+            hls_parallel_segments: Arc::new(Mutex::new(8)),
         }))
     }
 
@@ -313,6 +315,14 @@ impl DownloadEngine {
     pub fn set_remove_ads(&self, enabled: bool) {
         if let Ok(mut guard) = self.remove_ads.lock() {
             *guard = enabled;
+        }
+    }
+
+    /// m3u8 同时下载的分片数（默认 8，设置里可改 4-16）。正在下载的任务
+    /// 下次开始时生效。
+    pub fn set_hls_parallel_segments(&self, value: u32) {
+        if let Ok(mut guard) = self.hls_parallel_segments.lock() {
+            *guard = value.clamp(1, 32);
         }
     }
 
@@ -835,6 +845,7 @@ impl DownloadEngine {
         let cancels = Arc::clone(&self.hls_cancels);
         let retry_settings = Arc::clone(&self.retry_settings);
         let remove_ads = Arc::clone(&self.remove_ads);
+        let hls_parallel_segments = Arc::clone(&self.hls_parallel_segments);
         let cancel = Arc::new(AtomicBool::new(false));
         if let Ok(mut map) = cancels.lock() {
             map.insert(task_id.clone(), Arc::clone(&cancel));
@@ -855,8 +866,12 @@ impl DownloadEngine {
             // 出错自动重试（设置里可改，默认开）：分片拉取失败（网关抖动）时先自己重试，
             // 每次都靠断点续传进度文件从断的地方接着下；次数用完才标失败。
             // “始终重试”关着时，还没下到任何字节就失败的（链接失效、地址不对）不重试。
-            // 去广告开关读一次，整次下载（包括重试）都用这个值。
+            // 去广告开关和并发数读一次，整次下载（包括重试）都用这个值。
             let remove_ads = remove_ads.lock().map(|g| *g).unwrap_or(false);
+            let parallel_segments = hls_parallel_segments
+                .lock()
+                .map(|g| *g)
+                .unwrap_or(8) as usize;
             let mut attempt = 0u32;
             let result: Result<(), String> = loop {
                 attempt += 1;
@@ -866,7 +881,7 @@ impl DownloadEngine {
                         t.total_bytes = total;
                         t.speed_bytes_per_sec = speed;
                     });
-                }, remove_ads)
+                }, remove_ads, parallel_segments)
                 .await;
                 if r.is_ok() {
                     break r;
