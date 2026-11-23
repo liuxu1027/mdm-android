@@ -40,16 +40,17 @@ class DownloadForegroundService : Service(), ProgressListener {
             )
             setRemoveAds(prefs.getBoolean("remove_ads", false))
             setHlsParallelSegments(prefs.getInt("hls_parallel_segments", 8).toUInt())
-            setListener(this@DownloadForegroundService)
         }
         EngineRegistry.attach(engine!!)
-        // 启动时恢复上次保存的任务列表（退出、重启后列表不再丢失）。
-        // 恢复的任务是“已暂停”状态，点“继续”接着下。
+        // 启动时先从库里恢复任务，再接上监听：
+        // 引擎接上监听时会立刻推一次当前列表，恢复前推的是空列表，
+        // 会被保存逻辑当成“任务全删了”而清空库。
         runCatching {
             taskStore.loadAll().forEach { saved ->
                 runCatching { engine?.restoreTask(saved) }
             }
         }
+        engine?.setListener(this@DownloadForegroundService)
         startForegroundCompat(buildNotification("MDM 下载引擎运行中", 0, false))
     }
 
