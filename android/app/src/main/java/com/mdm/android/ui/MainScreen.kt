@@ -6,6 +6,8 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -142,8 +144,8 @@ fun MainScreen(viewModel: MainViewModel) {
     if (showAddDialog) {
         AddLinkDialog(
             onDismiss = { showAddDialog = false },
-            onConfirm = { link ->
-                viewModel.addLink(link)
+            onConfirm = { link, name ->
+                viewModel.addLink(link, name)
                 showAddDialog = false
             }
         )
@@ -158,6 +160,7 @@ fun MainScreen(viewModel: MainViewModel) {
             retryMaxAttempts = viewModel.retryMaxAttempts,
             retryDelaySecs = viewModel.retryDelaySecs,
             retryAlways = viewModel.retryAlways,
+            removeAds = viewModel.removeAds,
             downloadDir = viewModel.downloadDir,
             downloadLocation = viewModel.downloadLocation,
             hasAllFilesAccess = DownloadForegroundService.hasAllFilesAccess(context),
@@ -168,6 +171,7 @@ fun MainScreen(viewModel: MainViewModel) {
             onRetryMaxAttemptsChange = { viewModel.updateRetryMaxAttempts(it) },
             onRetryDelaySecsChange = { viewModel.updateRetryDelaySecs(it) },
             onRetryAlwaysChange = { viewModel.updateRetryAlways(it) },
+            onRemoveAdsChange = { viewModel.updateRemoveAds(it) },
             onDownloadLocationChange = { viewModel.updateDownloadLocation(it) },
             onOpenAllFilesAccess = openAllFilesAccess,
             onDismiss = { showSettings = false }
@@ -243,6 +247,13 @@ private fun DownloadTaskCard(
     val progress = if (task.totalBytes > 0uL) {
         (task.downloadedBytes.toFloat() / task.totalBytes.toFloat()).coerceIn(0f, 1f)
     } else 0f
+    // 进度条平滑动画：引擎一批一批汇报进度，数值会跳；条用动画匀速走过去，看着就是线性的。
+    // 百分比也跟着动画走；“已下载多少 MB”那两个数字还是实打实的值。
+    val animatedProgress by animateFloatAsState(
+        targetValue = progress,
+        animationSpec = tween(durationMillis = 600),
+        label = "downloadProgress"
+    )
 
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp)) {
@@ -273,11 +284,11 @@ private fun DownloadTaskCard(
                 )
             }
             Spacer(modifier = Modifier.height(8.dp))
-            LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth())
+            LinearProgressIndicator(progress = { animatedProgress }, modifier = Modifier.fillMaxWidth())
             Spacer(modifier = Modifier.height(4.dp))
             Text(
                 text = if (task.totalBytes > 0uL) {
-                    "${formatSize(task.downloadedBytes.toLong())} / ${formatSize(task.totalBytes.toLong())} · ${(progress * 100).toInt()}%"
+                    "${formatSize(task.downloadedBytes.toLong())} / ${formatSize(task.totalBytes.toLong())} · ${(animatedProgress * 100).toInt()}%"
                 } else if (task.downloadedBytes > 0uL) {
                     "已下载 ${formatSize(task.downloadedBytes.toLong())}"
                 } else {
@@ -329,22 +340,39 @@ private fun DownloadTaskCard(
 }
 
 @Composable
-private fun AddLinkDialog(onDismiss: () -> Unit, onConfirm: (String) -> Unit) {
+private fun AddLinkDialog(onDismiss: () -> Unit, onConfirm: (String, String?) -> Unit) {
     var text by remember { mutableStateOf("") }
+    var fileName by remember { mutableStateOf("") }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("新建下载任务") },
         text = {
-            OutlinedTextField(
-                value = text,
-                onValueChange = { text = it },
-                label = { Text("输入 HTTP/HTTPS、magnet:? 或 .m3u8 链接") },
-                singleLine = false,
-                maxLines = 4
-            )
+            Column {
+                OutlinedTextField(
+                    value = text,
+                    onValueChange = { text = it },
+                    label = { Text("输入 HTTP/HTTPS、magnet:? 或 .m3u8 链接") },
+                    singleLine = false,
+                    maxLines = 4,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = fileName,
+                    onValueChange = { fileName = it },
+                    label = { Text("文件名（可选，空着按链接取名）") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    "同名文件已存在时，会在名字后面加随机字母，不会顶掉已下完的文件",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
         },
         confirmButton = {
-            TextButton(onClick = { onConfirm(text) }) { Text("开始下载") }
+            TextButton(onClick = { onConfirm(text, fileName.ifBlank { null }) }) { Text("开始下载") }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) { Text("取消") }
@@ -375,6 +403,7 @@ private fun SettingsDialog(
     retryMaxAttempts: Int,
     retryDelaySecs: Int,
     retryAlways: Boolean,
+    removeAds: Boolean,
     downloadDir: String,
     downloadLocation: String,
     hasAllFilesAccess: Boolean,
@@ -385,6 +414,7 @@ private fun SettingsDialog(
     onRetryMaxAttemptsChange: (Int) -> Unit,
     onRetryDelaySecsChange: (Int) -> Unit,
     onRetryAlwaysChange: (Boolean) -> Unit,
+    onRemoveAdsChange: (Boolean) -> Unit,
     onDownloadLocationChange: (String) -> Unit,
     onOpenAllFilesAccess: () -> Unit,
     onDismiss: () -> Unit
@@ -552,6 +582,18 @@ private fun SettingsDialog(
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("去广告（m3u8 视频）", style = MaterialTheme.typography.bodyMedium)
+                            Text("同一列表拉两次，不一样的广告分片跳过不下", style = MaterialTheme.typography.bodySmall)
+                        }
+                        Switch(checked = removeAds, onCheckedChange = onRemoveAdsChange)
+                    }
                 }
             }
         },
