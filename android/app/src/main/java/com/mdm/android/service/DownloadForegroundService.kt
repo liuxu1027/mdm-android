@@ -21,9 +21,11 @@ import java.io.File
 class DownloadForegroundService : Service(), ProgressListener {
 
     private var engine: DownloadEngine? = null
+    private lateinit var taskStore: TaskStore
 
     override fun onCreate() {
         super.onCreate()
+        taskStore = TaskStore(this)
         val downloadDir = resolveDownloadDir(this)
         engine = DownloadEngine(downloadDir.absolutePath).apply {
             val prefs = getSharedPreferences("mdm_settings", Context.MODE_PRIVATE)
@@ -41,6 +43,13 @@ class DownloadForegroundService : Service(), ProgressListener {
             setListener(this@DownloadForegroundService)
         }
         EngineRegistry.attach(engine!!)
+        // 启动时恢复上次保存的任务列表（退出、重启后列表不再丢失）。
+        // 恢复的任务是“已暂停”状态，点“继续”接着下。
+        runCatching {
+            taskStore.loadAll().forEach { saved ->
+                runCatching { engine?.restoreTask(saved) }
+            }
+        }
         startForegroundCompat(buildNotification("MDM 下载引擎运行中", 0, false))
     }
 
@@ -68,7 +77,8 @@ class DownloadForegroundService : Service(), ProgressListener {
                 }
             }
             ACTION_EXIT -> {
-                // 彻底退出：正在下载的任务会被停掉，通知栏随服务一起消失。
+                // 彻底退出：先把任务列表落盘，再停掉下载服务、去掉通知栏。
+                runCatching { taskStore.saveNow(EngineRegistry.tasks.value) }
                 engine?.setListener(null)
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
@@ -79,6 +89,7 @@ class DownloadForegroundService : Service(), ProgressListener {
 
     override fun onTasksUpdated(tasks: List<DownloadTask>) {
         EngineRegistry.publish(tasks)
+        runCatching { taskStore.saveThrottled(tasks) }
         val active = tasks.filter { it.state == DownloadState.DOWNLOADING }
         if (active.isEmpty()) {
             updateNotification("暂无活动下载任务", 0, false)
@@ -135,6 +146,10 @@ class DownloadForegroundService : Service(), ProgressListener {
     }
 
     override fun onDestroy() {
+        // 服务被系统回收时也尽量把任务列表落盘一次。
+        if (::taskStore.isInitialized) {
+            runCatching { taskStore.saveNow(EngineRegistry.tasks.value) }
+        }
         engine?.setListener(null)
         super.onDestroy()
     }
