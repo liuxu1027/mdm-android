@@ -112,6 +112,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         applyRetrySettings()
     }
 
+    /** m3u8 去广告：同一列表拉两次，不一样的分片就是动态插入的广告，跳过不下。 */
+    var removeAds by mutableStateOf(prefs.getBoolean("remove_ads", false))
+        private set
+
+    fun updateRemoveAds(value: Boolean) {
+        removeAds = value
+        prefs.edit().putBoolean("remove_ads", value).apply()
+        EngineRegistry.engine?.setRemoveAds(value)
+    }
+
     /** 下载位置选择：public = 手机存储 Download/MDM，private = 应用私有目录。 */
     var downloadLocation by mutableStateOf(prefs.getString("download_location", "public") ?: "public")
         private set
@@ -122,7 +132,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         prefs.edit().putString("download_location", v).apply()
     }
 
-    fun addLink(rawInput: String) {
+    fun addLink(rawInput: String, filename: String? = null) {
         val trimmed = rawInput.trim()
         if (trimmed.isEmpty()) return
         val ctx = getApplication<Application>()
@@ -135,6 +145,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val intent = Intent(ctx, DownloadForegroundService::class.java).apply {
             this.action = action
             putExtra(DownloadForegroundService.EXTRA_URL, trimmed)
+            if (!filename.isNullOrBlank()) {
+                putExtra(DownloadForegroundService.EXTRA_FILENAME, filename.trim())
+            }
         }
         ContextCompat.startForegroundService(ctx, intent)
     }
