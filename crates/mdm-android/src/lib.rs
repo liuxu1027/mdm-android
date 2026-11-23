@@ -350,7 +350,7 @@ impl DownloadEngine {
         let display_name = save_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or(resolved_name);
+            .unwrap_or_else(|| resolved_name.clone());
 
         let conns = if connections == 0 {
             self.default_connections
@@ -428,7 +428,7 @@ impl DownloadEngine {
         let display_name = save_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or(resolved_name);
+            .unwrap_or_else(|| resolved_name.clone());
 
         let task = DownloadTask {
             id: id.clone(),
