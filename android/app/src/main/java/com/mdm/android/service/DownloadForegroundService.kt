@@ -37,6 +37,7 @@ class DownloadForegroundService : Service(), ProgressListener {
                 prefs.getBoolean("retry_always", false)
             )
             setRemoveAds(prefs.getBoolean("remove_ads", false))
+            setHlsParallelSegments(prefs.getInt("hls_parallel_segments", 8).toUInt())
             setListener(this@DownloadForegroundService)
         }
         EngineRegistry.attach(engine!!)
