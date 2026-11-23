@@ -122,6 +122,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         EngineRegistry.engine?.setRemoveAds(value)
     }
 
+    /** m3u8 同时下载的分片数（4-16），默认 8，新下载生效。 */
+    var hlsParallelSegments by mutableIntStateOf(prefs.getInt("hls_parallel_segments", 8))
+        private set
+
+    fun updateHlsParallelSegments(value: Int) {
+        val v = value.coerceIn(4, 16)
+        hlsParallelSegments = v
+        prefs.edit().putInt("hls_parallel_segments", v).apply()
+        EngineRegistry.engine?.setHlsParallelSegments(v.toUInt())
+    }
+
     /** 下载位置选择：public = 手机存储 Download/MDM，private = 应用私有目录。 */
     var downloadLocation by mutableStateOf(prefs.getString("download_location", "public") ?: "public")
         private set
