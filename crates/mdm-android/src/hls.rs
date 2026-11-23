@@ -367,54 +367,73 @@ pub async fn download_hls(
     let started = Instant::now();
     let resume_base = downloaded; // 续传时已有字节不计入本次速度
 
-    for (chunk_idx, chunk) in plans[start_idx..].chunks(PARALLEL_SEGMENTS).enumerate() {
-        if is_cancelled(cancel) {
-            return Err(ERR_CANCELLED.to_string());
-        }
-        let results = futures::future::join_all(chunk.iter().map(|plan| {
+    // 流水线提速：8 个连接一直满着，一个分片下完立刻上下一个，不用等
+    // 整组都下完；先到的分片先缓存，按顺序写文件（.ts 必须按顺序拼）。
+    // 原来是 8 个一组 join_all，一组里最慢的那个拖住整组，其他连接干等。
+    let mut set = tokio::task::JoinSet::new();
+    let mut next_to_fetch = start_idx;
+    let mut next_to_write = start_idx;
+    let mut buffered: HashMap<usize, Vec<u8>> = HashMap::new();
+    while next_to_write < plans.len() {
+        // 有空位就补上下一个分片，保持 8 个连接满着。
+        while set.len() < PARALLEL_SEGMENTS && next_to_fetch < plans.len() {
+            let idx = next_to_fetch;
+            next_to_fetch += 1;
+            let plan = &plans[idx];
             let client = client.clone();
             let url = plan.url.clone();
             let range = plan.range;
             let key = plan.key.clone();
-            async move {
+            set.spawn(async move {
                 let mut data = fetch_bytes(&client, &url, range).await?;
                 if let Some((key_bytes, iv)) = key {
                     data = decrypt_aes128(&key_bytes, &iv, data)?;
                 }
-                Ok::<Vec<u8>, String>(data)
-            }
-        }))
-        .await;
-
-        for data in results {
-            if is_cancelled(cancel) {
-                return Err(ERR_CANCELLED.to_string());
-            }
-            let data = data?;
-            out.write_all(&data)
-                .await
-                .map_err(|e| format!("写入文件失败: {e}"))?;
-            downloaded += data.len() as u64;
-            let elapsed = started.elapsed().as_secs_f64().max(0.1);
-            on_progress(
-                downloaded,
-                total_bytes,
-                ((downloaded - resume_base) as f64 / elapsed) as u64,
-            );
+                Ok::<(usize, Vec<u8>), String>((idx, data))
+            });
         }
-        let done = start_idx + chunk_idx * PARALLEL_SEGMENTS + chunk.len();
-        // 每写完一块就记一次进度：这次失败的话，下次从这里继续。
-        let _ = tokio::fs::write(
-            &progress_file,
-            format!("{}\n{}\n{}", playlist_url, plans.len(), done),
-        )
-        .await;
-        log::info!(
-            "[HLS] 已写 {} / {} 分片（{} 字节）",
-            done,
-            plans.len(),
-            downloaded
-        );
+        if is_cancelled(cancel) {
+            return Err(ERR_CANCELLED.to_string());
+        }
+        match set.join_next().await {
+            Some(Ok(Ok((idx, data)))) => {
+                buffered.insert(idx, data);
+                // 按顺序写出所有能写的分片。
+                while let Some(data) = buffered.remove(&next_to_write) {
+                    if is_cancelled(cancel) {
+                        return Err(ERR_CANCELLED.to_string());
+                    }
+                    out.write_all(&data)
+                        .await
+                        .map_err(|e| format!("写入文件失败: {e}"))?;
+                    downloaded += data.len() as u64;
+                    next_to_write += 1;
+                    let elapsed = started.elapsed().as_secs_f64().max(0.1);
+                    on_progress(
+                        downloaded,
+                        total_bytes,
+                        ((downloaded - resume_base) as f64 / elapsed) as u64,
+                    );
+                    // 每写完 8 个或全部写完时记一次进度：这次失败的话，下次从这里继续。
+                    if next_to_write % PARALLEL_SEGMENTS == 0 || next_to_write == plans.len() {
+                        let _ = tokio::fs::write(
+                            &progress_file,
+                            format!("{}\n{}\n{}", playlist_url, plans.len(), next_to_write),
+                        )
+                        .await;
+                        log::info!(
+                            "[HLS] 已写 {} / {} 分片（{} 字节）",
+                            next_to_write,
+                            plans.len(),
+                            downloaded
+                        );
+                    }
+                }
+            }
+            Some(Ok(Err(e))) => return Err(e),
+            Some(Err(e)) => return Err(format!("分片任务异常: {e}")),
+            None => break,
+        }
     }
 
     out.flush()
