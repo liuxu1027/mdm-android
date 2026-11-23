@@ -265,8 +265,15 @@ pub async fn download_hls(
     );
 
     // 2. 算好每个分片的下载计划：地址、Range（无 offset 时接着上一个）、密钥只取一次。
+    //    按 HLS 规矩，一个 #EXT-X-KEY 管它后面所有分片，直到出现新的 KEY 或 METHOD=NONE，
+    //    所以要把密钥往后带：分片自己带了密钥就用它的并记住，没带就沿用记住的。
+    //    （之前只认分片自己带的密钥，解析器只给第一个分片带密钥时，后面的分片
+    //    会按密文原文写进文件，任务还显示 COMPLETED——ppnix 就是这么坏的。）
     let mut key_cache: HashMap<String, Vec<u8>> = HashMap::new();
     let mut range_end: HashMap<String, u64> = HashMap::new();
+    // 当前生效的密钥：(密钥字节, 标签里显式给的 IV；没有就是 None，表示按分片序号算)。
+    // None 表示当前没有加密（还没见过 KEY，或刚见过 METHOD=NONE）。
+    let mut current_key: Option<(Vec<u8>, Option<[u8; 16]>)> = None;
     let mut plans: Vec<SegPlan> = Vec::with_capacity(media.segments.len());
     for (i, seg) in media.segments.iter().enumerate() {
         let url = resolve(&base, &seg.uri)?;
@@ -277,8 +284,9 @@ pub async fn download_hls(
             range_end.insert(url.to_string(), start + br.length);
             (start, start + br.length - 1)
         });
-        let key = match &seg.key {
-            Some(k) => match k.method {
+        // 分片声明了密钥就更新当前密钥（换密钥、中途变明文都在这里处理）。
+        if let Some(k) = &seg.key {
+            match k.method {
                 KeyMethod::AES128 => {
                     let key_uri = k
                         .uri
@@ -294,16 +302,28 @@ pub async fn download_hls(
                             b
                         }
                     };
-                    let seq = media.media_sequence + i as u64;
-                    let iv = match &k.iv {
-                        Some(hex) => parse_iv(hex)?,
-                        None => seq_iv(seq),
+                    let explicit_iv = match &k.iv {
+                        Some(hex) => Some(parse_iv(hex)?),
+                        None => None,
                     };
-                    Some((key_bytes, iv))
+                    current_key = Some((key_bytes, explicit_iv));
                 }
-                KeyMethod::None => None,
+                KeyMethod::None => {
+                    current_key = None;
+                }
                 _ => return Err("不支持的加密方式（只支持 AES-128）".to_string()),
-            },
+            }
+        }
+        // 没声明密钥的分片沿用当前密钥；IV 有显式的就用显式的，没有按分片序号算。
+        let key = match &current_key {
+            Some((key_bytes, explicit_iv)) => {
+                let seq = media.media_sequence + i as u64;
+                let iv = match explicit_iv {
+                    Some(iv) => *iv,
+                    None => seq_iv(seq),
+                };
+                Some((key_bytes.clone(), iv))
+            }
             None => None,
         };
         plans.push(SegPlan {
