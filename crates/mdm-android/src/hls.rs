@@ -5,7 +5,7 @@
 //! 取到的分片；fMP4（EXT-X-MAP）暂不支持。输出是拼接的 MPEG-TS，可用
 //! VLC / MX Player 等播放。下载不走全局限速（走自己的 reqwest 客户端）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -155,18 +155,23 @@ struct SegPlan {
 /// 下载一个 m3u8 视频：拉播放列表 → 选清晰度 → 下分片（可解密）→ 合并成 .ts。
 ///
 /// `on_progress(已下字节, 预估总字节, 平均速度 B/s)`，总字节未知时为 0。
+/// `remove_ads` 开时：同一列表再拉一次，两次不一样的分片就是服务器动态
+/// 插进去的广告，跳过不下（实测：两次拉取除了 5 个广告分片外完全一样，
+/// 广告位置每次都变；两次一致或差异太多时不过滤，全部下载）。
 pub async fn download_hls(
     client: &reqwest::Client,
     playlist_url: &str,
     out_path: &Path,
     cancel: &Arc<AtomicBool>,
     mut on_progress: impl FnMut(u64, u64, u64),
+    remove_ads: bool,
 ) -> Result<(), String> {
     let base = url::Url::parse(playlist_url)
         .map_err(|_| format!("无效的播放列表地址: {playlist_url}"))?;
 
     // 1. 拉播放列表；主播放列表最多再跟一层，选最高码率。
     let mut playlist = fetch_and_parse(client, &base).await?;
+    let mut media_url = base.clone();
     let mut bandwidth: Option<u64> = None;
     for _ in 0..2 {
         match playlist {
@@ -180,12 +185,13 @@ pub async fn download_hls(
                 bandwidth = Some(variant.bandwidth);
                 let variant_url = resolve(&base, &variant.uri)?;
                 log::info!("[HLS] 选清晰度: 码率 {} bps, {}", variant.bandwidth, variant_url);
+                media_url = variant_url.clone();
                 playlist = fetch_and_parse(client, &variant_url).await?;
             }
             Playlist::MediaPlaylist(_) => break,
         }
     }
-    let media = match playlist {
+    let mut media = match playlist {
         Playlist::MediaPlaylist(m) => m,
         Playlist::MasterPlaylist(_) => {
             return Err("主播放列表嵌套太深，未找到媒体播放列表".to_string());
@@ -200,6 +206,50 @@ pub async fn download_hls(
     }
     if !media.end_list {
         log::info!("[HLS] 直播播放列表：只下载本次取到的分片");
+    }
+
+    // 去广告（设置里开）：同一列表再拉一次，两次不一样的分片就是服务器
+    // 动态插进去的广告，跳过不下。两次一致就不过滤；差异太多（超过 10%）
+    // 说明列表对不上，也不过滤，全部下载，宁可多下也不错下。
+    if remove_ads {
+        match fetch_and_parse(client, &media_url).await {
+            Ok(Playlist::MediaPlaylist(second)) => {
+                let urls2: HashSet<String> = second
+                    .segments
+                    .iter()
+                    .filter_map(|s| resolve(&base, &s.uri).ok().map(|u| u.to_string()))
+                    .collect();
+                let before = media.segments.len();
+                let removed = media
+                    .segments
+                    .iter()
+                    .filter(|s| {
+                        resolve(&base, &s.uri)
+                            .map(|u| !urls2.contains(&u.to_string()))
+                            .unwrap_or(false)
+                    })
+                    .count();
+                if removed > 0 && removed * 10 <= before {
+                    media.segments.retain(|s| {
+                        resolve(&base, &s.uri)
+                            .map(|u| urls2.contains(&u.to_string()))
+                            .unwrap_or(true)
+                    });
+                    log::info!("[HLS] 去广告：跳过 {removed} 个广告分片（共 {before} 个）");
+                } else if removed > 0 {
+                    // 差异太多说明两次列表对不上：不动原来的列表，全部下载。
+                    log::info!("[HLS] 去广告：差异太多（{removed}/{before}），不过滤，全部下载");
+                } else {
+                    log::info!("[HLS] 去广告：两次列表一致，没有广告分片");
+                }
+            }
+            Ok(_) => {
+                log::info!("[HLS] 去广告：第二次拉取不是媒体播放列表，不过滤");
+            }
+            Err(e) => {
+                log::info!("[HLS] 去广告：第二次拉取失败（{e}），不过滤");
+            }
+        }
     }
 
     // 预估总大小：码率 × 总时长 / 8；没有码率信息时总大小未知（传 0）。
