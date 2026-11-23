@@ -42,6 +42,7 @@ fun MainScreen(viewModel: MainViewModel) {
     var showSettings by remember { mutableStateOf(false) }
     var showExitConfirm by remember { mutableStateOf(false) }
     var showStorageDialog by remember { mutableStateOf(false) }
+    var pendingRemoveId by remember { mutableStateOf<String?>(null) }
     val context = LocalContext.current
     val hasActiveDownload = tasks.any { it.state == DownloadState.DOWNLOADING }
 
@@ -130,7 +131,7 @@ fun MainScreen(viewModel: MainViewModel) {
                             task = task,
                             onPause = { viewModel.pause(task.id) },
                             onResume = { viewModel.resume(task.id) },
-                            onRemove = { viewModel.remove(task.id) }
+                            onRemove = { pendingRemoveId = task.id }
                         )
                     }
                 }
@@ -207,6 +208,26 @@ fun MainScreen(viewModel: MainViewModel) {
             },
             dismissButton = {
                 TextButton(onClick = { showExitConfirm = false }) { Text("取消") }
+            }
+        )
+    }
+
+    if (pendingRemoveId != null) {
+        AlertDialog(
+            onDismissRequest = { pendingRemoveId = null },
+            title = { Text("移除任务") },
+            text = { Text("同时删掉磁盘上的文件吗？选“仅从列表删除”，文件还留在手机里。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    viewModel.remove(pendingRemoveId!!, true)
+                    pendingRemoveId = null
+                }) { Text("从存储删除") }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    viewModel.remove(pendingRemoveId!!, false)
+                    pendingRemoveId = null
+                }) { Text("仅从列表删除") }
             }
         )
     }
