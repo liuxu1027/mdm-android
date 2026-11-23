@@ -120,14 +120,14 @@ fn normalize_key(b: Vec<u8>) -> Result<Vec<u8>, String> {
     if b.len() == 16 {
         return Ok(b);
     }
+    // 注意：32 个十六进制字符的密钥不要按 hex 解码！
+    // 实测 ppnix（https://www.ppnix.com/info/m3u8/key）返回 32 位 hex 字符串
+    // "ba9bf05693b9fa202d922dd43a08f281"，按 hex 解码成 16 字节去解密，
+    // 解出来是乱码；取前 16 个 ASCII 字符（"ba9bf05693b9fa20"）当 AES-128
+    // 密钥，解出来 100/100 个 TS 包都有 0x47 同步头，才是对的。
+    // 所以这里直接取前 16 个字节。
     if b.len() == 32 && b.iter().all(|c| c.is_ascii_hexdigit()) {
-        let s = std::str::from_utf8(&b).map_err(|_| "密钥不是合法的十六进制".to_string())?;
-        return (0..16)
-            .map(|i| {
-                u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
-                    .map_err(|_| "密钥不是合法的十六进制".to_string())
-            })
-            .collect();
+        return Ok(b[..16].to_vec());
     }
     Err(format!(
         "密钥长度错误（应为 16 字节或 32 个十六进制字符）：{} 字节",
