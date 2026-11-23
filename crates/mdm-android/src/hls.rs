@@ -22,9 +22,6 @@ use tokio::io::AsyncWriteExt;
 /// 取消时返回的错误文本，lib.rs 靠它把任务标成“已暂停”。
 pub const ERR_CANCELLED: &str = "下载已取消";
 
-/// 同时下载的分片数。
-const PARALLEL_SEGMENTS: usize = 8;
-
 /// 断点续传进度文件：放在输出文件旁边，内容是三行：
 /// 播放列表地址、分片总数、已写完的分片数。
 /// 任务失败或取消时保留，下次继续时从这里接着下；
@@ -158,6 +155,7 @@ struct SegPlan {
 /// `remove_ads` 开时：同一列表再拉一次，两次不一样的分片就是服务器动态
 /// 插进去的广告，跳过不下（实测：两次拉取除了 5 个广告分片外完全一样，
 /// 广告位置每次都变；两次一致或差异太多时不过滤，全部下载）。
+/// `parallel_segments` 是同时下载的分片数（设置里可改，默认 8）。
 pub async fn download_hls(
     client: &reqwest::Client,
     playlist_url: &str,
@@ -165,6 +163,7 @@ pub async fn download_hls(
     cancel: &Arc<AtomicBool>,
     mut on_progress: impl FnMut(u64, u64, u64),
     remove_ads: bool,
+    parallel_segments: usize,
 ) -> Result<(), String> {
     let base = url::Url::parse(playlist_url)
         .map_err(|_| format!("无效的播放列表地址: {playlist_url}"))?;
@@ -387,16 +386,18 @@ pub async fn download_hls(
     let started = Instant::now();
     let resume_base = downloaded; // 续传时已有字节不计入本次速度
 
-    // 流水线提速：8 个连接一直满着，一个分片下完立刻上下一个，不用等
-    // 整组都下完；先到的分片先缓存，按顺序写文件（.ts 必须按顺序拼）。
+    // 流水线提速：parallel_segments 个连接一直满着，一个分片下完立刻上下一个，
+    // 不用等整组都下完；先到的分片先缓存，按顺序写文件（.ts 必须按顺序拼）。
     // 原来是 8 个一组 join_all，一组里最慢的那个拖住整组，其他连接干等。
+    // 并发数为 0 会一个分片也下不下来，这里至少按 1 算（调用方也会 clamp）。
+    let parallel_segments = parallel_segments.max(1);
     let mut set = tokio::task::JoinSet::new();
     let mut next_to_fetch = start_idx;
     let mut next_to_write = start_idx;
     let mut buffered: HashMap<usize, Vec<u8>> = HashMap::new();
     while next_to_write < plans.len() {
-        // 有空位就补上下一个分片，保持 8 个连接满着。
-        while set.len() < PARALLEL_SEGMENTS && next_to_fetch < plans.len() {
+        // 有空位就补上下一个分片，保持 parallel_segments 个连接满着。
+        while set.len() < parallel_segments && next_to_fetch < plans.len() {
             let idx = next_to_fetch;
             next_to_fetch += 1;
             let plan = &plans[idx];
@@ -434,8 +435,8 @@ pub async fn download_hls(
                         total_bytes,
                         ((downloaded - resume_base) as f64 / elapsed) as u64,
                     );
-                    // 每写完 8 个或全部写完时记一次进度：这次失败的话，下次从这里继续。
-                    if next_to_write % PARALLEL_SEGMENTS == 0 || next_to_write == plans.len() {
+                    // 每写完 parallel_segments 个或全部写完时记一次进度：这次失败的话，下次从这里继续。
+                    if next_to_write % parallel_segments == 0 || next_to_write == plans.len() {
                         let _ = tokio::fs::write(
                             &progress_file,
                             format!("{}\n{}\n{}", playlist_url, plans.len(), next_to_write),
