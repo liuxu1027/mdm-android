@@ -36,6 +36,7 @@ class DownloadForegroundService : Service(), ProgressListener {
                 prefs.getInt("retry_delay_secs", 5).toULong(),
                 prefs.getBoolean("retry_always", false)
             )
+            setRemoveAds(prefs.getBoolean("remove_ads", false))
             setListener(this@DownloadForegroundService)
         }
         EngineRegistry.attach(engine!!)
@@ -48,7 +49,8 @@ class DownloadForegroundService : Service(), ProgressListener {
                 val url = intent.getStringExtra(EXTRA_URL)
                 if (!url.isNullOrBlank()) {
                     // 连接数传 0 = 用设置里的默认值
-                    runCatching { engine?.addHttpDownload(url, null, 0u) }
+                    val filename = intent.getStringExtra(EXTRA_FILENAME)
+                    runCatching { engine?.addHttpDownload(url, filename, 0u) }
                 }
             }
             ACTION_ADD_MAGNET -> {
@@ -60,7 +62,8 @@ class DownloadForegroundService : Service(), ProgressListener {
             ACTION_ADD_HLS -> {
                 val url = intent.getStringExtra(EXTRA_URL)
                 if (!url.isNullOrBlank()) {
-                    runCatching { engine?.addHlsDownload(url, null) }
+                    val filename = intent.getStringExtra(EXTRA_FILENAME)
+                    runCatching { engine?.addHlsDownload(url, filename) }
                 }
             }
             ACTION_EXIT -> {
@@ -144,6 +147,7 @@ class DownloadForegroundService : Service(), ProgressListener {
         const val ACTION_ADD_HLS = "com.mdm.android.ADD_HLS"
         const val ACTION_EXIT = "com.mdm.android.EXIT"
         const val EXTRA_URL = "extra_url"
+        const val EXTRA_FILENAME = "extra_filename"
 
         /** 是否有“所有文件访问权限”（Android 11+）。 */
         fun hasAllFilesAccess(context: Context): Boolean {
