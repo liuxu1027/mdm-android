@@ -161,6 +161,7 @@ fun MainScreen(viewModel: MainViewModel) {
             retryDelaySecs = viewModel.retryDelaySecs,
             retryAlways = viewModel.retryAlways,
             removeAds = viewModel.removeAds,
+            hlsParallelSegments = viewModel.hlsParallelSegments,
             downloadDir = viewModel.downloadDir,
             downloadLocation = viewModel.downloadLocation,
             hasAllFilesAccess = DownloadForegroundService.hasAllFilesAccess(context),
@@ -172,6 +173,7 @@ fun MainScreen(viewModel: MainViewModel) {
             onRetryDelaySecsChange = { viewModel.updateRetryDelaySecs(it) },
             onRetryAlwaysChange = { viewModel.updateRetryAlways(it) },
             onRemoveAdsChange = { viewModel.updateRemoveAds(it) },
+            onHlsParallelSegmentsChange = { viewModel.updateHlsParallelSegments(it) },
             onDownloadLocationChange = { viewModel.updateDownloadLocation(it) },
             onOpenAllFilesAccess = openAllFilesAccess,
             onDismiss = { showSettings = false }
@@ -404,6 +406,7 @@ private fun SettingsDialog(
     retryDelaySecs: Int,
     retryAlways: Boolean,
     removeAds: Boolean,
+    hlsParallelSegments: Int,
     downloadDir: String,
     downloadLocation: String,
     hasAllFilesAccess: Boolean,
@@ -415,6 +418,7 @@ private fun SettingsDialog(
     onRetryDelaySecsChange: (Int) -> Unit,
     onRetryAlwaysChange: (Boolean) -> Unit,
     onRemoveAdsChange: (Boolean) -> Unit,
+    onHlsParallelSegmentsChange: (Int) -> Unit,
     onDownloadLocationChange: (String) -> Unit,
     onOpenAllFilesAccess: () -> Unit,
     onDismiss: () -> Unit
@@ -594,6 +598,21 @@ private fun SettingsDialog(
                         }
                         Switch(checked = removeAds, onCheckedChange = onRemoveAdsChange)
                     }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        "m3u8 同时下载的分片数：$hlsParallelSegments",
+                        style = MaterialTheme.typography.titleSmall
+                    )
+                    Slider(
+                        value = hlsParallelSegments.toFloat(),
+                        onValueChange = { onHlsParallelSegmentsChange(it.toInt()) },
+                        valueRange = 4f..16f,
+                        steps = 11
+                    )
+                    Text(
+                        "分片越多越快，但部分网关会限速；新下载生效",
+                        style = MaterialTheme.typography.bodySmall
+                    )
                 }
             }
         },
