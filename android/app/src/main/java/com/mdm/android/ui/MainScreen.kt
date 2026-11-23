@@ -8,10 +8,12 @@ import android.os.Build
 import android.provider.Settings
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -125,15 +127,53 @@ fun MainScreen(viewModel: MainViewModel) {
             } else {
                 LazyColumn(
                     modifier = Modifier.fillMaxSize(),
-                    contentPadding = PaddingValues(16.dp),
+                    // 底部多留 88dp：列表滚到底时最后一行能顶到悬浮 + 按钮上面去，删除按钮不再被盖住。
+                    contentPadding = PaddingValues(start = 16.dp, top = 16.dp, end = 16.dp, bottom = 88.dp),
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     items(filteredTasks, key = { it.id }) { task ->
-                        DownloadTaskCard(
-                            task = task,
-                            onPause = { viewModel.pause(task.id) },
-                            onResume = { viewModel.resume(task.id) },
-                            onRemove = { pendingRemoveId = task.id }
+                        // 左滑或右滑都弹出同一个三选一删除框；滑动本身不删东西，框里选了才删。
+                        val dismissState = rememberSwipeToDismissBoxState(
+                            confirmValueChange = { value ->
+                                if (value == SwipeToDismissBoxValue.StartToEnd ||
+                                    value == SwipeToDismissBoxValue.EndToStart
+                                ) {
+                                    pendingRemoveId = task.id
+                                }
+                                false
+                            }
+                        )
+                        SwipeToDismissBox(
+                            state = dismissState,
+                            backgroundContent = {
+                                val alignment = when (dismissState.dismissDirection) {
+                                    SwipeToDismissBoxValue.StartToEnd -> Alignment.CenterStart
+                                    else -> Alignment.CenterEnd
+                                }
+                                Box(
+                                    modifier = Modifier.fillMaxSize()
+                                        .background(
+                                            MaterialTheme.colorScheme.errorContainer,
+                                            RoundedCornerShape(12.dp)
+                                        )
+                                        .padding(horizontal = 20.dp),
+                                    contentAlignment = alignment
+                                ) {
+                                    Icon(
+                                        Icons.Default.Delete,
+                                        contentDescription = "删除",
+                                        tint = MaterialTheme.colorScheme.onErrorContainer
+                                    )
+                                }
+                            },
+                            content = {
+                                DownloadTaskCard(
+                                    task = task,
+                                    onPause = { viewModel.pause(task.id) },
+                                    onResume = { viewModel.resume(task.id) },
+                                    onRemove = { pendingRemoveId = task.id }
+                                )
+                            }
                         )
                     }
                 }
@@ -249,13 +289,15 @@ private fun DownloadTaskCard(
     val progress = if (task.totalBytes > 0uL) {
         (task.downloadedBytes.toFloat() / task.totalBytes.toFloat()).coerceIn(0f, 1f)
     } else 0f
-    // 进度条平滑动画：引擎一批一批汇报进度，数值会跳；条用动画匀速走过去，看着就是线性的。
-    // 百分比也跟着动画走；“已下载多少 MB”那两个数字还是实打实的值。
+    // 进度条平滑动画：引擎一批一批汇报进度，数值会跳；条和“已下载多少 MB”都跟着动画匀速走，看着就是线性的。
+    // 动画 600ms 内一定追上真实值，所以暂停/完成时显示的还是实打实的值。
     val animatedProgress by animateFloatAsState(
         targetValue = progress,
         animationSpec = tween(durationMillis = 600),
         label = "downloadProgress"
     )
+    // 跟着动画走的已下载字节数：和进度条、百分比同步滑动，不再一下跳 10MB、18MB、23MB。
+    val animatedBytes = (animatedProgress * task.totalBytes.toFloat()).toLong()
 
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp)) {
@@ -290,7 +332,7 @@ private fun DownloadTaskCard(
             Spacer(modifier = Modifier.height(4.dp))
             Text(
                 text = if (task.totalBytes > 0uL) {
-                    "${formatSize(task.downloadedBytes.toLong())} / ${formatSize(task.totalBytes.toLong())} · ${(animatedProgress * 100).toInt()}%"
+                    "${formatSize(animatedBytes)} / ${formatSize(task.totalBytes.toLong())} · ${(animatedProgress * 100).toInt()}%"
                 } else if (task.downloadedBytes > 0uL) {
                     "已下载 ${formatSize(task.downloadedBytes.toLong())}"
                 } else {
