@@ -13,9 +13,8 @@ import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.grid.GridCells
-import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
@@ -23,6 +22,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.ExitToApp
+import androidx.compose.material.icons.filled.InsertDriveFile
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Settings
@@ -133,13 +134,11 @@ fun MainScreen(viewModel: MainViewModel) {
                     Text("点击右下角 + 添加 HTTP、磁力或 m3u8 视频链接", style = MaterialTheme.typography.bodyMedium)
                 }
             } else {
-                LazyVerticalGrid(
-                    columns = GridCells.Fixed(2),
+                LazyColumn(
                     modifier = Modifier.fillMaxSize(),
-                    // 双列紧凑卡片，底部为悬浮添加按钮留出空间。
-                    contentPadding = PaddingValues(start = 8.dp, top = 12.dp, end = 8.dp, bottom = 88.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    // 单列全宽窄行，底部为悬浮添加按钮留出空间。
+                    contentPadding = PaddingValues(start = 8.dp, top = 8.dp, end = 8.dp, bottom = 88.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     items(filteredTasks, key = { it.id }) { task ->
                         DownloadTaskCard(
@@ -356,78 +355,95 @@ private fun DownloadTaskCard(
     val animatedBytes = (animatedProgress * task.totalBytes.toFloat()).toLong()
 
     Card(onClick = onClick, modifier = Modifier.fillMaxWidth()) {
-        Column(
-            modifier = Modifier.padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp)
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            Text(
-                text = task.title,
-                style = MaterialTheme.typography.titleSmall,
-                fontWeight = FontWeight.Medium,
-                maxLines = 2,
-                minLines = 2,
-                overflow = TextOverflow.Ellipsis
+            Icon(
+                Icons.Default.InsertDriveFile,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.size(28.dp)
             )
-            Text(
-                text = when (task.kind) {
-                    DownloadKind.HTTP -> "HTTP"
-                    DownloadKind.TORRENT_MAGNET -> "Magnet"
-                    DownloadKind.TORRENT_FILE -> "Torrent"
-                    DownloadKind.HLS -> "视频"
-                },
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.primary
-            )
-            LinearProgressIndicator(
-                progress = { animatedProgress },
-                modifier = Modifier.fillMaxWidth().height(5.dp)
-            )
-            Text(
-                text = if (task.totalBytes > 0uL) {
-                    "${formatSize(animatedBytes)} / ${formatSize(task.totalBytes.toLong())} · ${(animatedProgress * 100).toInt()}%"
-                } else if (task.downloadedBytes > 0uL) {
-                    "已下载 ${formatSize(task.downloadedBytes.toLong())}"
-                } else {
-                    "等待开始…"
-                },
-                style = MaterialTheme.typography.labelSmall,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis
-            )
-            if (task.errorMessage != null) {
-                Text(
-                    text = task.errorMessage!!,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.error,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis
-                )
-            }
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(3.dp)
             ) {
-                Text(
-                    text = if (task.kind == DownloadKind.TORRENT_MAGNET || task.kind == DownloadKind.TORRENT_FILE) {
-                        "${stateLabel(task.state)} · ↓${formatSpeed(task.speedBytesPerSec.toLong())}"
-                    } else {
-                        "${stateLabel(task.state)} · ${formatSpeed(task.speedBytesPerSec.toLong())}"
-                    },
-                    style = MaterialTheme.typography.labelSmall,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f)
-                )
-                if (task.state == DownloadState.DOWNLOADING) {
-                    IconButton(onClick = onPause, modifier = Modifier.size(32.dp)) {
-                        Icon(Icons.Default.Pause, contentDescription = "暂停")
-                    }
-                } else if (task.state == DownloadState.PAUSED || task.state == DownloadState.FAILED) {
-                    IconButton(onClick = onResume, modifier = Modifier.size(32.dp)) {
-                        Icon(Icons.Default.PlayArrow, contentDescription = "继续")
-                    }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = task.title,
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.Medium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = when (task.kind) {
+                            DownloadKind.HTTP -> "HTTP"
+                            DownloadKind.TORRENT_MAGNET -> "Magnet"
+                            DownloadKind.TORRENT_FILE -> "Torrent"
+                            DownloadKind.HLS -> "视频"
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary
+                    )
                 }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = if (task.totalBytes > 0uL) {
+                            "${(animatedProgress * 100).toInt()}% | ${formatSize(animatedBytes)}"
+                        } else if (task.downloadedBytes > 0uL) {
+                            "已下载 ${formatSize(task.downloadedBytes.toLong())}"
+                        } else {
+                            "等待开始…"
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "${stateLabel(task.state)} · ${formatSpeed(task.speedBytesPerSec.toLong())}",
+                        style = MaterialTheme.typography.labelSmall,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                if (task.totalBytes > 0uL) {
+                    LinearProgressIndicator(
+                        progress = { animatedProgress },
+                        modifier = Modifier.fillMaxWidth().height(3.dp)
+                    )
+                }
+                if (task.errorMessage != null) {
+                    Text(
+                        text = task.errorMessage!!,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.error,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+            if (task.state == DownloadState.DOWNLOADING) {
+                IconButton(onClick = onPause, modifier = Modifier.size(30.dp)) {
+                    Icon(Icons.Default.Pause, contentDescription = "暂停")
+                }
+            } else if (task.state == DownloadState.PAUSED || task.state == DownloadState.FAILED) {
+                IconButton(onClick = onResume, modifier = Modifier.size(30.dp)) {
+                    Icon(Icons.Default.PlayArrow, contentDescription = "继续")
+                }
+            }
+            IconButton(onClick = onClick, modifier = Modifier.size(30.dp)) {
+                Icon(Icons.Default.MoreVert, contentDescription = "任务操作")
             }
         }
     }
