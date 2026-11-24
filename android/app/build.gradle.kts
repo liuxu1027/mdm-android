@@ -34,6 +34,19 @@ android {
         }
     }
 
+    flavorDimensions += "edition"
+    productFlavors {
+        create("lite") {
+            dimension = "edition"
+            versionNameSuffix = "-lite"
+        }
+        create("full") {
+            dimension = "edition"
+            applicationIdSuffix = ".full"
+            versionNameSuffix = "-full"
+        }
+    }
+
     buildTypes {
         release {
             signingConfig = signingConfigs.getByName("release")
@@ -81,6 +94,8 @@ dependencies {
     implementation("net.java.dev.jna:jna:5.14.0@aar")
     // yt-dlp 与 Python Android 运行时；应用只打包 arm64-v8a。
     implementation("io.github.junkfood02.youtubedl-android:library:0.18.1")
+    // Full edition can merge separate high-resolution video and audio streams.
+    add("fullImplementation", "io.github.junkfood02.youtubedl-android:ffmpeg:0.18.1")
 }
 
 // libmdm_android.so 链接了 NDK 的 C++ 共享运行时，APK 里必须自带它，

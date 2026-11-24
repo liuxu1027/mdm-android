@@ -10,18 +10,36 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
 import com.mdm.android.service.DownloadForegroundService
 import com.mdm.android.service.EngineRegistry
+import com.mdm.android.service.YoutubeDownloadSpec
+import com.mdm.android.service.YoutubeMediaResolver
+import com.mdm.android.service.YoutubeResolveResult
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
 import uniffi.mdm_android.DownloadKind
 import uniffi.mdm_android.DownloadState
 import uniffi.mdm_android.DownloadTask
+
+sealed class YoutubeResolveUiState {
+    object Idle : YoutubeResolveUiState()
+    object Loading : YoutubeResolveUiState()
+    data class Ready(val result: YoutubeResolveResult) : YoutubeResolveUiState()
+    data class Failed(val message: String) : YoutubeResolveUiState()
+}
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     val tasks: StateFlow<List<DownloadTask>> = EngineRegistry.tasks
 
     private val prefs =
         application.getSharedPreferences("mdm_settings", Context.MODE_PRIVATE)
+
+    var youtubeResolveState by mutableStateOf<YoutubeResolveUiState>(YoutubeResolveUiState.Idle)
+        private set
+    private var youtubeResolveJob: kotlinx.coroutines.Job? = null
+    private var youtubeRequestedName: String? = null
 
     /** 每任务默认连接数（1-16），新下载生效。 */
     var maxConnections by mutableStateOf(prefs.getInt("max_connections", 8))
@@ -155,10 +173,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun addLink(rawInput: String, filename: String? = null) {
         val trimmed = rawInput.trim()
         if (trimmed.isEmpty()) return
+        if (isYouTubePageLink(trimmed)) {
+            resolveYoutubeLink(trimmed, filename)
+            return
+        }
         val ctx = getApplication<Application>()
         val action = when {
             trimmed.startsWith("magnet:?") -> DownloadForegroundService.ACTION_ADD_MAGNET
-            isYouTubePageLink(trimmed) -> DownloadForegroundService.ACTION_ADD_YOUTUBE
             trimmed.substringBefore("?").endsWith(".m3u8", ignoreCase = true) ->
                 DownloadForegroundService.ACTION_ADD_HLS
             else -> DownloadForegroundService.ACTION_ADD_HTTP
@@ -171,6 +192,48 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
         ContextCompat.startForegroundService(ctx, intent)
+    }
+
+    fun resolveYoutubeLink(url: String, filename: String? = null) {
+        youtubeResolveJob?.cancel()
+        youtubeRequestedName = filename?.trim()?.takeIf { it.isNotBlank() }
+        youtubeResolveState = YoutubeResolveUiState.Loading
+        youtubeResolveJob = viewModelScope.launch {
+            try {
+                val result = YoutubeMediaResolver.resolve(getApplication(), url.trim())
+                youtubeResolveState = YoutubeResolveUiState.Ready(result)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                youtubeResolveState = YoutubeResolveUiState.Failed(
+                    error.message?.take(220)?.ifBlank { null } ?: "YouTube 信息解析失败"
+                )
+            }
+        }
+    }
+
+    fun dismissYoutubePicker() {
+        youtubeResolveJob?.cancel()
+        youtubeResolveJob = null
+        youtubeRequestedName = null
+        youtubeResolveState = YoutubeResolveUiState.Idle
+    }
+
+    fun addYoutubeDownloads(specs: List<YoutubeDownloadSpec>) {
+        if (specs.isEmpty()) return
+        val ctx = getApplication<Application>()
+        val names = ArrayList(specs.mapIndexed { index, spec ->
+            if (specs.size == 1 && index == 0) youtubeRequestedName ?: spec.title else spec.title
+        })
+        val intent = Intent(ctx, DownloadForegroundService::class.java).apply {
+            action = DownloadForegroundService.ACTION_ADD_YOUTUBE_BATCH
+            putStringArrayListExtra(DownloadForegroundService.EXTRA_YOUTUBE_URLS, ArrayList(specs.map { it.url }))
+            putStringArrayListExtra(DownloadForegroundService.EXTRA_YOUTUBE_NAMES, names)
+            putStringArrayListExtra(DownloadForegroundService.EXTRA_YOUTUBE_FORMATS, ArrayList(specs.map { it.formatSelector }))
+            putStringArrayListExtra(DownloadForegroundService.EXTRA_YOUTUBE_SUBTITLES, ArrayList(specs.map { it.subtitleLanguage.orEmpty() }))
+        }
+        ContextCompat.startForegroundService(ctx, intent)
+        dismissYoutubePicker()
     }
 
     /** 彻底退出：停掉下载服务、去掉通知栏，界面随后关闭。 */

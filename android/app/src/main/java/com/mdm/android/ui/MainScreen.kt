@@ -12,6 +12,7 @@ import androidx.core.content.FileProvider
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -37,6 +38,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.mdm.android.service.DownloadForegroundService
+import com.mdm.android.service.YoutubeRuntime
 import uniffi.mdm_android.DownloadKind
 import uniffi.mdm_android.DownloadState
 import uniffi.mdm_android.DownloadTask
@@ -57,6 +59,7 @@ fun MainScreen(viewModel: MainViewModel) {
     var renameValue by remember { mutableStateOf("") }
     var renameError by remember { mutableStateOf<String?>(null) }
     val context = LocalContext.current
+    val youtubeResolveState = viewModel.youtubeResolveState
     val hasActiveDownload = tasks.any { it.state == DownloadState.DOWNLOADING }
 
     // 打开“所有文件访问权限”的系统设置页（特殊应用权限，不在应用详情的常规权限里）。
@@ -160,6 +163,38 @@ fun MainScreen(viewModel: MainViewModel) {
                 viewModel.addLink(link, name)
                 showAddDialog = false
             }
+        )
+    }
+
+    when (val state = youtubeResolveState) {
+        YoutubeResolveUiState.Idle -> Unit
+        YoutubeResolveUiState.Loading -> AlertDialog(
+            onDismissRequest = { viewModel.dismissYoutubePicker() },
+            title = { Text("正在解析 YouTube") },
+            text = {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 2.dp)
+                    Spacer(modifier = Modifier.width(12.dp))
+                    Text("正在读取视频/播放列表信息，请稍候…")
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { viewModel.dismissYoutubePicker() }) { Text("取消") }
+            }
+        )
+        is YoutubeResolveUiState.Failed -> AlertDialog(
+            onDismissRequest = { viewModel.dismissYoutubePicker() },
+            title = { Text("解析失败") },
+            text = { Text(state.message) },
+            confirmButton = {
+                TextButton(onClick = { viewModel.dismissYoutubePicker() }) { Text("关闭") }
+            }
+        )
+        is YoutubeResolveUiState.Ready -> YoutubePickerDialog(
+            result = state.result,
+            ffmpegEnabled = YoutubeRuntime.ffmpegEnabled,
+            onDismiss = { viewModel.dismissYoutubePicker() },
+            onDownload = { viewModel.addYoutubeDownloads(it) }
         )
     }
 
@@ -358,11 +393,15 @@ private fun DownloadTaskCard(
     val animatedBytes = (animatedProgress * task.totalBytes.toFloat()).toLong()
 
     Card(onClick = onClick, modifier = Modifier.fillMaxWidth()) {
-        Row(
+        Column(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+            verticalArrangement = Arrangement.spacedBy(4.dp)
         ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
             Icon(
                 Icons.Default.InsertDriveFile,
                 contentDescription = null,
@@ -421,12 +460,6 @@ private fun DownloadTaskCard(
                         overflow = TextOverflow.Ellipsis
                     )
                 }
-                if (task.totalBytes > 0uL) {
-                    LinearProgressIndicator(
-                        progress = { animatedProgress },
-                        modifier = Modifier.fillMaxWidth().height(3.dp)
-                    )
-                }
                 if (task.errorMessage != null) {
                     Text(
                         text = task.errorMessage!!,
@@ -448,6 +481,17 @@ private fun DownloadTaskCard(
             }
             IconButton(onClick = onClick, modifier = Modifier.size(30.dp)) {
                 Icon(Icons.Default.MoreVert, contentDescription = "任务操作")
+            }
+            }
+            if (task.totalBytes > 0uL) {
+                Row(modifier = Modifier.fillMaxWidth()) {
+                    Spacer(modifier = Modifier.width(36.dp))
+                    LinearProgressIndicator(
+                        progress = { animatedProgress },
+                        modifier = Modifier.weight(0.7f).height(3.dp)
+                    )
+                    Spacer(modifier = Modifier.weight(0.3f))
+                }
             }
         }
     }
@@ -517,7 +561,7 @@ private fun AddLinkDialog(onDismiss: () -> Unit, onConfirm: (String, String?) ->
                     onValueChange = {
                         text = it
                     },
-                    label = { Text("输入 YouTube 视频、HTTP/HTTPS 直链、magnet:? 或 .m3u8 链接") },
+                    label = { Text("输入 YouTube 视频/播放列表、HTTP/HTTPS 直链、magnet:? 或 .m3u8 链接") },
                     singleLine = false,
                     maxLines = 4,
                     modifier = Modifier.fillMaxWidth()
@@ -532,7 +576,7 @@ private fun AddLinkDialog(onDismiss: () -> Unit, onConfirm: (String, String?) ->
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    "YouTube 链接由 yt-dlp 解析并下载；同名文件会自动加随机字母，不会覆盖已有文件。",
+                    "YouTube 会先解析视频与播放列表信息，再选择清晰度、音频、字幕和下载条目；同名文件不会覆盖已有文件。",
                     style = MaterialTheme.typography.bodySmall
                 )
             }
@@ -600,8 +644,8 @@ private fun SettingsDialog(
         title = { Text("设置") },
         text = {
             Column(
-                modifier = Modifier.verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(16.dp)
+                modifier = Modifier.heightIn(max = 560.dp).verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 Column {
                     Text("下载目录", style = MaterialTheme.typography.titleSmall)
@@ -672,7 +716,10 @@ private fun SettingsDialog(
                 Column {
                     Text("全局限速", style = MaterialTheme.typography.titleSmall)
                     Spacer(modifier = Modifier.height(8.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
                         speedOptions.forEach { (bps, label) ->
                             FilterChip(
                                 selected = speedLimitBps == bps,
@@ -685,7 +732,10 @@ private fun SettingsDialog(
                 Column {
                     Text("上传限速（磁力做种）", style = MaterialTheme.typography.titleSmall)
                     Spacer(modifier = Modifier.height(8.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
                         speedOptions.forEach { (bps, label) ->
                             FilterChip(
                                 selected = uploadLimitBps == bps,

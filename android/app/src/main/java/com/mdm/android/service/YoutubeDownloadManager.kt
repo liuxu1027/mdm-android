@@ -26,6 +26,7 @@ class YoutubeDownloadManager(
     private val onTasksChanged: (List<DownloadTask>) -> Unit
 ) {
     private val appContext = context.applicationContext
+    private val optionsPrefs = appContext.getSharedPreferences("youtube_download_options", Context.MODE_PRIVATE)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val lock = Any()
     private val tasks = linkedMapOf<String, DownloadTask>()
@@ -52,8 +53,17 @@ class YoutubeDownloadManager(
         publish()
     }
 
-    fun add(url: String, requestedName: String?) {
+    fun add(
+        url: String,
+        requestedName: String?,
+        formatSelector: String? = null,
+        subtitleLanguage: String? = null
+    ) {
         val id = UUID.randomUUID().toString()
+        optionsPrefs.edit()
+            .putString("$id.format", formatSelector?.takeIf { it.isNotBlank() } ?: DEFAULT_FORMAT)
+            .putString("$id.subtitle", subtitleLanguage?.takeIf { it.isNotBlank() })
+            .apply()
         val pendingPath = File(downloadDir, ".yt-dlp-$id.pending").absolutePath
         val task = DownloadTask(
             id = id,
@@ -61,7 +71,7 @@ class YoutubeDownloadManager(
             sourceUrl = url,
             savePath = pendingPath,
             kind = DownloadKind.YOUTUBE,
-            state = DownloadState.DOWNLOADING,
+            state = DownloadState.QUEUED,
             totalBytes = 0u,
             downloadedBytes = 0u,
             speedBytesPerSec = 0u,
@@ -71,7 +81,7 @@ class YoutubeDownloadManager(
         )
         synchronized(lock) { tasks[id] = task }
         publish()
-        start(id, requestedName)
+        startQueuedTasks()
     }
 
     fun pause(id: String) {
@@ -97,14 +107,15 @@ class YoutubeDownloadManager(
         val task = get(id) ?: return
         if (task.state == DownloadState.COMPLETED || task.state == DownloadState.DOWNLOADING) return
         pauseRequested.remove(id)
+        update(id) { it.copy(state = DownloadState.QUEUED, errorMessage = null) }
         val previous = jobs[id]
         if (previous?.isActive == true) {
             scope.launch {
                 previous.join()
-                if (contains(id)) start(id, task.requestedOutputName())
+                if (contains(id)) startQueuedTasks()
             }
         } else {
-            start(id, task.requestedOutputName())
+            startQueuedTasks()
         }
     }
 
@@ -127,6 +138,7 @@ class YoutubeDownloadManager(
             }
             generatedFiles.forEach { runCatching { it.delete() } }
         }
+        optionsPrefs.edit().remove("$id.format").remove("$id.subtitle").apply()
     }
 
     fun hasActiveDownloads(): Boolean = synchronized(lock) {
@@ -165,10 +177,13 @@ class YoutubeDownloadManager(
         val job = scope.launch(start = CoroutineStart.LAZY) {
             try {
                 YoutubeDL.getInstance().init(appContext)
+                YoutubeRuntime.init(appContext)
                 val source = get(id)?.sourceUrl ?: return@launch
+                val formatSelector = optionsPrefs.getString("$id.format", null) ?: DEFAULT_FORMAT
+                val subtitleLanguage = optionsPrefs.getString("$id.subtitle", null)
                 val infoRequest = YoutubeDLRequest(source).apply {
                     addOption("--no-playlist")
-                    addOption("-f", FORMAT)
+                    addOption("-f", formatSelector)
                 }
                 val info = withContext(Dispatchers.IO) {
                     YoutubeDL.getInstance().getInfo(infoRequest)
@@ -213,7 +228,13 @@ class YoutubeDownloadManager(
                     addOption("--no-playlist")
                     addOption("--no-warnings")
                     addOption("--continue")
-                    addOption("-f", FORMAT)
+                    addOption("-f", formatSelector)
+                    if (!subtitleLanguage.isNullOrBlank()) {
+                        addOption("--write-subs")
+                        addOption("--write-auto-subs")
+                        addOption("--sub-langs", subtitleLanguage)
+                        addOption("--sub-format", "vtt/best")
+                    }
                     addOption("-o", File(outputBase, "${resolvedBase.replace("%", "%%")}.%(ext)s").absolutePath)
                 }
                 val processId = "mdm-ytdlp-${id}-${System.nanoTime()}"
@@ -304,6 +325,7 @@ class YoutubeDownloadManager(
             } finally {
                 processIds.entries.removeIf { it.key == id }
                 jobs.remove(id)
+                startQueuedTasks()
             }
         }
         jobs[id] = job
@@ -359,14 +381,31 @@ class YoutubeDownloadManager(
             directory.listFiles()
                 ?.filter { it.name.startsWith("$baseName.") && it.name.endsWith(".part") }
                 ?.maxOfOrNull { it.length() } ?: 0L
-        )
+            )
+
+    private fun startQueuedTasks() {
+        while (true) {
+            val next = synchronized(lock) {
+                if (tasks.values.count { it.state == DownloadState.DOWNLOADING } >= MAX_ACTIVE_DOWNLOADS) {
+                    return@synchronized null
+                }
+                val queued = tasks.values.firstOrNull { it.state == DownloadState.QUEUED }
+                    ?: return@synchronized null
+                tasks[queued.id] = queued.copy(state = DownloadState.DOWNLOADING)
+                queued
+            } ?: return
+            publish()
+            start(next.id, next.requestedOutputName())
+        }
+    }
 
     private fun findFinalOutput(directory: File, baseName: String): File? =
         directory.listFiles()
             ?.filter {
                 it.isFile && it.name.startsWith("$baseName.") &&
                     !it.name.endsWith(".part") && !it.name.endsWith(".ytdl") &&
-                    !it.name.endsWith(".info.json")
+                    !it.name.endsWith(".info.json") &&
+                    it.extension.lowercase() in VIDEO_EXTENSIONS
             }
             ?.maxByOrNull { it.lastModified() }
 
@@ -391,7 +430,8 @@ class YoutubeDownloadManager(
     private fun publish() = onTasksChanged(tasksSnapshot())
 
     companion object {
-        private const val FORMAT = "best[ext=mp4]/best"
+        private const val DEFAULT_FORMAT = "best[ext=mp4]/best"
+        private const val MAX_ACTIVE_DOWNLOADS = 2
         private val VIDEO_EXTENSIONS = setOf("mp4", "m4v", "webm", "mkv", "mov", "3gp", "flv")
     }
 }

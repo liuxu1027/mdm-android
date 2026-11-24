@@ -96,6 +96,20 @@ class DownloadForegroundService : Service(), ProgressListener {
                     youtubeManager?.add(url, intent.getStringExtra(EXTRA_FILENAME))
                 }
             }
+            ACTION_ADD_YOUTUBE_BATCH -> {
+                val urls = intent.getStringArrayListExtra(EXTRA_YOUTUBE_URLS).orEmpty()
+                val names = intent.getStringArrayListExtra(EXTRA_YOUTUBE_NAMES).orEmpty()
+                val formats = intent.getStringArrayListExtra(EXTRA_YOUTUBE_FORMATS).orEmpty()
+                val subtitles = intent.getStringArrayListExtra(EXTRA_YOUTUBE_SUBTITLES).orEmpty()
+                urls.forEachIndexed { index, url ->
+                    youtubeManager?.add(
+                        url,
+                        names.getOrNull(index),
+                        formats.getOrNull(index),
+                        subtitles.getOrNull(index)?.takeIf { it.isNotBlank() }
+                    )
+                }
+            }
             ACTION_PAUSE_YOUTUBE -> intent.getStringExtra(EXTRA_TASK_ID)?.let { youtubeManager?.pause(it) }
             ACTION_RESUME_YOUTUBE -> intent.getStringExtra(EXTRA_TASK_ID)?.let { youtubeManager?.resume(it) }
             ACTION_REMOVE_YOUTUBE -> intent.getStringExtra(EXTRA_TASK_ID)?.let { id ->
@@ -222,6 +236,7 @@ class DownloadForegroundService : Service(), ProgressListener {
         const val ACTION_ADD_MAGNET = "com.mdm.android.ADD_MAGNET"
         const val ACTION_ADD_HLS = "com.mdm.android.ADD_HLS"
         const val ACTION_ADD_YOUTUBE = "com.mdm.android.ADD_YOUTUBE"
+        const val ACTION_ADD_YOUTUBE_BATCH = "com.mdm.android.ADD_YOUTUBE_BATCH"
         const val ACTION_PAUSE_YOUTUBE = "com.mdm.android.PAUSE_YOUTUBE"
         const val ACTION_RESUME_YOUTUBE = "com.mdm.android.RESUME_YOUTUBE"
         const val ACTION_REMOVE_YOUTUBE = "com.mdm.android.REMOVE_YOUTUBE"
@@ -231,6 +246,10 @@ class DownloadForegroundService : Service(), ProgressListener {
         const val EXTRA_FILENAME = "extra_filename"
         const val EXTRA_TASK_ID = "extra_task_id"
         const val EXTRA_DELETE_FILES = "extra_delete_files"
+        const val EXTRA_YOUTUBE_URLS = "extra_youtube_urls"
+        const val EXTRA_YOUTUBE_NAMES = "extra_youtube_names"
+        const val EXTRA_YOUTUBE_FORMATS = "extra_youtube_formats"
+        const val EXTRA_YOUTUBE_SUBTITLES = "extra_youtube_subtitles"
 
         /** 是否有“所有文件访问权限”（Android 11+）。 */
         fun hasAllFilesAccess(context: Context): Boolean =
