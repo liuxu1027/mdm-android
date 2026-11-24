@@ -19,6 +19,7 @@ pub enum DownloadKind {
     TorrentMagnet,
     TorrentFile,
     Hls,
+    Youtube,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]

@@ -79,6 +79,8 @@ dependencies {
 
     // UniFFI Kotlin 依赖 JNA 调用原生 .so
     implementation("net.java.dev.jna:jna:5.14.0@aar")
+    // yt-dlp 与 Python Android 运行时；应用只打包 arm64-v8a。
+    implementation("io.github.junkfood02.youtubedl-android:library:0.18.1")
 }
 
 // libmdm_android.so 链接了 NDK 的 C++ 共享运行时，APK 里必须自带它，

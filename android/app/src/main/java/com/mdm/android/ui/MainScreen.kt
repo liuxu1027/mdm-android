@@ -188,6 +188,7 @@ fun MainScreen(viewModel: MainViewModel) {
             onHlsParallelSegmentsChange = { viewModel.updateHlsParallelSegments(it) },
             onDownloadLocationChange = { viewModel.updateDownloadLocation(it) },
             onOpenAllFilesAccess = openAllFilesAccess,
+            onCheckYtDlpUpdates = { viewModel.checkYtDlpUpdates() },
             onDismiss = { showSettings = false }
         )
     }
@@ -264,15 +265,17 @@ fun MainScreen(viewModel: MainViewModel) {
                         },
                         modifier = Modifier.fillMaxWidth()
                     ) { Text("打开", modifier = Modifier.fillMaxWidth()) }
-                    TextButton(
-                        onClick = {
-                            renameValue = selectedTask.title
-                            renameError = null
-                            renamingTaskId = selectedTask.id
-                            selectedTaskId = null
-                        },
-                        modifier = Modifier.fillMaxWidth()
-                    ) { Text("重命名", modifier = Modifier.fillMaxWidth()) }
+                    if (selectedTask.kind != DownloadKind.YOUTUBE) {
+                        TextButton(
+                            onClick = {
+                                renameValue = selectedTask.title
+                                renameError = null
+                                renamingTaskId = selectedTask.id
+                                selectedTaskId = null
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) { Text("重命名", modifier = Modifier.fillMaxWidth()) }
+                    }
                     TextButton(
                         onClick = {
                             pendingRemoveId = selectedTask.id
@@ -386,6 +389,7 @@ private fun DownloadTaskCard(
                             DownloadKind.TORRENT_MAGNET -> "Magnet"
                             DownloadKind.TORRENT_FILE -> "Torrent"
                             DownloadKind.HLS -> "视频"
+                            DownloadKind.YOUTUBE -> "YouTube"
                         },
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.primary
@@ -503,7 +507,6 @@ private fun findPlayableFile(root: File): File? {
 private fun AddLinkDialog(onDismiss: () -> Unit, onConfirm: (String, String?) -> Unit) {
     var text by remember { mutableStateOf("") }
     var fileName by remember { mutableStateOf("") }
-    var inputError by remember { mutableStateOf<String?>(null) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("新建下载任务") },
@@ -513,9 +516,8 @@ private fun AddLinkDialog(onDismiss: () -> Unit, onConfirm: (String, String?) ->
                     value = text,
                     onValueChange = {
                         text = it
-                        inputError = null
                     },
-                    label = { Text("输入 HTTP/HTTPS 直链、magnet:? 或 .m3u8 链接") },
+                    label = { Text("输入 YouTube 视频、HTTP/HTTPS 直链、magnet:? 或 .m3u8 链接") },
                     singleLine = false,
                     maxLines = 4,
                     modifier = Modifier.fillMaxWidth()
@@ -528,42 +530,20 @@ private fun AddLinkDialog(onDismiss: () -> Unit, onConfirm: (String, String?) ->
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
-                if (inputError != null) {
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        inputError!!,
-                        color = MaterialTheme.colorScheme.error,
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                }
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    "同名文件已存在时，会在名字后面加随机字母，不会顶掉已下完的文件。YouTube 页面链接暂不支持直接下载。",
+                    "YouTube 链接由 yt-dlp 解析并下载；同名文件会自动加随机字母，不会覆盖已有文件。",
                     style = MaterialTheme.typography.bodySmall
                 )
             }
         },
         confirmButton = {
-            TextButton(onClick = {
-                if (isYouTubePageLink(text)) {
-                    inputError = "YouTube 页面链接不是可下载的直链，当前版本暂不支持解析。"
-                } else {
-                    onConfirm(text, fileName.ifBlank { null })
-                }
-            }) { Text("开始下载") }
+            TextButton(onClick = { onConfirm(text, fileName.ifBlank { null }) }) { Text("开始下载") }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) { Text("取消") }
         }
     )
-}
-
-private fun isYouTubePageLink(input: String): Boolean {
-    val value = input.trim()
-    if (value.isEmpty()) return false
-    val withScheme = if (value.contains("://")) value else "https://$value"
-    val host = runCatching { Uri.parse(withScheme).host?.lowercase() }.getOrNull() ?: return false
-    return host == "youtu.be" || host == "youtube.com" || host.endsWith(".youtube.com")
 }
 
 private fun formatSpeed(bytesPerSec: Long): String = when {
@@ -605,6 +585,7 @@ private fun SettingsDialog(
     onHlsParallelSegmentsChange: (Int) -> Unit,
     onDownloadLocationChange: (String) -> Unit,
     onOpenAllFilesAccess: () -> Unit,
+    onCheckYtDlpUpdates: () -> Unit,
     onDismiss: () -> Unit
 ) {
     val speedOptions = listOf(
@@ -797,6 +778,16 @@ private fun SettingsDialog(
                         "分片越多越快，但部分网关会限速；新下载生效",
                         style = MaterialTheme.typography.bodySmall
                     )
+                }
+                Column {
+                    Text("yt-dlp 视频解析", style = MaterialTheme.typography.titleSmall)
+                    Text(
+                        "更新检查为手动操作，只使用 Stable，不会自动切换到 Nightly。",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    TextButton(onClick = onCheckYtDlpUpdates) {
+                        Text("检查 yt-dlp 更新（Stable）")
+                    }
                 }
             }
         },

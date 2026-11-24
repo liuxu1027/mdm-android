@@ -13,6 +13,7 @@ import androidx.lifecycle.AndroidViewModel
 import com.mdm.android.service.DownloadForegroundService
 import com.mdm.android.service.EngineRegistry
 import kotlinx.coroutines.flow.StateFlow
+import uniffi.mdm_android.DownloadKind
 import uniffi.mdm_android.DownloadState
 import uniffi.mdm_android.DownloadTask
 
@@ -40,6 +41,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             ctx,
             Intent(ctx, DownloadForegroundService::class.java)
         )
+    }
+
+    fun checkYtDlpUpdates() {
+        val ctx = getApplication<Application>()
+        val intent = Intent(ctx, DownloadForegroundService::class.java).apply {
+            action = DownloadForegroundService.ACTION_UPDATE_YTDLP
+        }
+        ContextCompat.startForegroundService(ctx, intent)
     }
 
     fun updateMaxConnections(value: Int) {
@@ -149,6 +158,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val ctx = getApplication<Application>()
         val action = when {
             trimmed.startsWith("magnet:?") -> DownloadForegroundService.ACTION_ADD_MAGNET
+            isYouTubePageLink(trimmed) -> DownloadForegroundService.ACTION_ADD_YOUTUBE
             trimmed.substringBefore("?").endsWith(".m3u8", ignoreCase = true) ->
                 DownloadForegroundService.ACTION_ADD_HLS
             else -> DownloadForegroundService.ACTION_ADD_HTTP
@@ -173,15 +183,42 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun pause(id: String) {
-        runCatching { EngineRegistry.engine?.pauseTask(id) }
+        if (tasks.value.firstOrNull { it.id == id }?.kind == DownloadKind.YOUTUBE) {
+            sendYoutubeTaskAction(DownloadForegroundService.ACTION_PAUSE_YOUTUBE, id)
+        } else {
+            runCatching { EngineRegistry.engine?.pauseTask(id) }
+        }
     }
 
     fun resume(id: String) {
-        runCatching { EngineRegistry.engine?.resumeTask(id) }
+        if (tasks.value.firstOrNull { it.id == id }?.kind == DownloadKind.YOUTUBE) {
+            sendYoutubeTaskAction(DownloadForegroundService.ACTION_RESUME_YOUTUBE, id)
+        } else {
+            runCatching { EngineRegistry.engine?.resumeTask(id) }
+        }
     }
 
     fun remove(id: String, deleteFiles: Boolean) {
-        runCatching { EngineRegistry.engine?.removeTask(id, deleteFiles) }
+        if (tasks.value.firstOrNull { it.id == id }?.kind == DownloadKind.YOUTUBE) {
+            val ctx = getApplication<Application>()
+            val intent = Intent(ctx, DownloadForegroundService::class.java).apply {
+                action = DownloadForegroundService.ACTION_REMOVE_YOUTUBE
+                putExtra(DownloadForegroundService.EXTRA_TASK_ID, id)
+                putExtra(DownloadForegroundService.EXTRA_DELETE_FILES, deleteFiles)
+            }
+            ContextCompat.startForegroundService(ctx, intent)
+        } else {
+            runCatching { EngineRegistry.engine?.removeTask(id, deleteFiles) }
+        }
+    }
+
+    private fun sendYoutubeTaskAction(action: String, id: String) {
+        val ctx = getApplication<Application>()
+        val intent = Intent(ctx, DownloadForegroundService::class.java).apply {
+            this.action = action
+            putExtra(DownloadForegroundService.EXTRA_TASK_ID, id)
+        }
+        ContextCompat.startForegroundService(ctx, intent)
     }
 
     fun rename(id: String, newTitle: String): Result<Unit> = runCatching {

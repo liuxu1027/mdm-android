@@ -12,21 +12,32 @@ import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import com.mdm.android.MainActivity
 import com.mdm.android.MdmApplication
+import com.yausername.youtubedl_android.YoutubeDL
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import uniffi.mdm_android.DownloadEngine
 import uniffi.mdm_android.DownloadState
 import uniffi.mdm_android.DownloadTask
 import uniffi.mdm_android.ProgressListener
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 
 class DownloadForegroundService : Service(), ProgressListener {
 
     private var engine: DownloadEngine? = null
+    private var youtubeManager: YoutubeDownloadManager? = null
     private lateinit var taskStore: TaskStore
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val updatingYoutubeDL = AtomicBoolean(false)
 
     override fun onCreate() {
         super.onCreate()
         taskStore = TaskStore(this)
         val downloadDir = resolveDownloadDir(this)
+        EngineRegistry.publishYoutube(emptyList())
         engine = DownloadEngine(downloadDir.absolutePath).apply {
             val prefs = getSharedPreferences("mdm_settings", Context.MODE_PRIVATE)
             setDefaultConnections(prefs.getInt("max_connections", 8).toUInt())
@@ -42,13 +53,18 @@ class DownloadForegroundService : Service(), ProgressListener {
             setHlsParallelSegments(prefs.getInt("hls_parallel_segments", 8).toUInt())
         }
         EngineRegistry.attach(engine!!)
-        // 启动时先从库里恢复任务，再接上监听：
-        // 引擎接上监听时会立刻推一次当前列表，恢复前推的是空列表，
-        // 会被保存逻辑当成“任务全删了”而清空库。
+        youtubeManager = YoutubeDownloadManager(this, downloadDir) { youtubeTasks ->
+            EngineRegistry.publishYoutube(youtubeTasks)
+            runCatching { taskStore.saveThrottled(EngineRegistry.tasks.value) }
+            refreshNotification()
+        }
+        // 先从库里恢复任务，再接监听，避免空任务快照清空数据库。
         runCatching {
-            taskStore.loadAll().forEach { saved ->
-                runCatching { engine?.restoreTask(saved) }
-            }
+            val saved = taskStore.loadAll()
+            saved.filter { it.kind != uniffi.mdm_android.DownloadKind.YOUTUBE }
+                .forEach { task -> runCatching { engine?.restoreTask(task) } }
+            EngineRegistry.publish(engine?.listTasks().orEmpty())
+            youtubeManager?.restore(saved.filter { it.kind == uniffi.mdm_android.DownloadKind.YOUTUBE })
         }
         engine?.setListener(this@DownloadForegroundService)
         startForegroundCompat(buildNotification("MDM 下载引擎运行中", 0, false))
@@ -59,16 +75,13 @@ class DownloadForegroundService : Service(), ProgressListener {
             ACTION_ADD_HTTP -> {
                 val url = intent.getStringExtra(EXTRA_URL)
                 if (!url.isNullOrBlank()) {
-                    // 连接数传 0 = 用设置里的默认值
                     val filename = intent.getStringExtra(EXTRA_FILENAME)
                     runCatching { engine?.addHttpDownload(url, filename, 0u) }
                 }
             }
             ACTION_ADD_MAGNET -> {
                 val magnet = intent.getStringExtra(EXTRA_URL)
-                if (!magnet.isNullOrBlank()) {
-                    runCatching { engine?.addMagnetDownload(magnet) }
-                }
+                if (!magnet.isNullOrBlank()) runCatching { engine?.addMagnetDownload(magnet) }
             }
             ACTION_ADD_HLS -> {
                 val url = intent.getStringExtra(EXTRA_URL)
@@ -77,8 +90,20 @@ class DownloadForegroundService : Service(), ProgressListener {
                     runCatching { engine?.addHlsDownload(url, filename) }
                 }
             }
+            ACTION_ADD_YOUTUBE -> {
+                val url = intent.getStringExtra(EXTRA_URL)
+                if (!url.isNullOrBlank()) {
+                    youtubeManager?.add(url, intent.getStringExtra(EXTRA_FILENAME))
+                }
+            }
+            ACTION_PAUSE_YOUTUBE -> intent.getStringExtra(EXTRA_TASK_ID)?.let { youtubeManager?.pause(it) }
+            ACTION_RESUME_YOUTUBE -> intent.getStringExtra(EXTRA_TASK_ID)?.let { youtubeManager?.resume(it) }
+            ACTION_REMOVE_YOUTUBE -> intent.getStringExtra(EXTRA_TASK_ID)?.let { id ->
+                youtubeManager?.remove(id, intent.getBooleanExtra(EXTRA_DELETE_FILES, false))
+            }
+            ACTION_UPDATE_YTDLP -> checkYoutubeDLUpdates()
             ACTION_EXIT -> {
-                // 彻底退出：先把任务列表落盘，再停掉下载服务、去掉通知栏。
+                youtubeManager?.shutdown()
                 runCatching { taskStore.saveNow(EngineRegistry.tasks.value) }
                 engine?.setListener(null)
                 stopForeground(STOP_FOREGROUND_REMOVE)
@@ -90,8 +115,12 @@ class DownloadForegroundService : Service(), ProgressListener {
 
     override fun onTasksUpdated(tasks: List<DownloadTask>) {
         EngineRegistry.publish(tasks)
-        runCatching { taskStore.saveThrottled(tasks) }
-        val active = tasks.filter { it.state == DownloadState.DOWNLOADING }
+        runCatching { taskStore.saveThrottled(EngineRegistry.tasks.value) }
+        refreshNotification()
+    }
+
+    private fun refreshNotification() {
+        val active = EngineRegistry.tasks.value.filter { it.state == DownloadState.DOWNLOADING }
         if (active.isEmpty()) {
             updateNotification("暂无活动下载任务", 0, false)
             return
@@ -99,8 +128,37 @@ class DownloadForegroundService : Service(), ProgressListener {
         val total = active.sumOf { it.totalBytes.toLong() }
         val done = active.sumOf { it.downloadedBytes.toLong() }
         val progress = if (total > 0) ((done * 100) / total).toInt().coerceIn(0, 100) else 0
-        val title = "正在下载 ${active.size} 个任务"
-        updateNotification(title, progress, total == 0L)
+        updateNotification("正在下载 ${active.size} 个任务", progress, total == 0L)
+    }
+
+    private fun checkYoutubeDLUpdates() {
+        if (!updatingYoutubeDL.compareAndSet(false, true)) return
+        if (youtubeManager?.hasActiveDownloads() == true) {
+            updateNotification("请先暂停 YouTube 下载，再检查 yt-dlp 更新", 0, false)
+            updatingYoutubeDL.set(false)
+            return
+        }
+        updateNotification("正在使用 Stable 检查 yt-dlp 更新…", 0, true)
+        serviceScope.launch {
+            try {
+                YoutubeDL.getInstance().init(applicationContext)
+                val status = YoutubeDL.getInstance().updateYoutubeDL(
+                    applicationContext,
+                    YoutubeDL.UpdateChannel.STABLE
+                )
+                val version = YoutubeDL.getInstance().versionName(applicationContext).orEmpty()
+                val message = when (status) {
+                    YoutubeDL.UpdateStatus.DONE -> "yt-dlp 已更新${version.takeIf { it.isNotBlank() }?.let { "：$it" }.orEmpty()}"
+                    YoutubeDL.UpdateStatus.ALREADY_UP_TO_DATE -> "yt-dlp 已是最新 Stable 版本${version.takeIf { it.isNotBlank() }?.let { "：$it" }.orEmpty()}"
+                    null -> "yt-dlp 更新检查已完成"
+                }
+                updateNotification(message, 0, false)
+            } catch (error: Exception) {
+                updateNotification("yt-dlp 更新检查失败：${error.message?.take(160) ?: "未知错误"}", 0, false)
+            } finally {
+                updatingYoutubeDL.set(false)
+            }
+        }
     }
 
     private fun startForegroundCompat(notification: Notification) {
@@ -147,11 +205,12 @@ class DownloadForegroundService : Service(), ProgressListener {
     }
 
     override fun onDestroy() {
-        // 服务被系统回收时也尽量把任务列表落盘一次。
+        youtubeManager?.shutdown()
         if (::taskStore.isInitialized) {
             runCatching { taskStore.saveNow(EngineRegistry.tasks.value) }
         }
         engine?.setListener(null)
+        serviceScope.cancel()
         super.onDestroy()
     }
 
@@ -162,23 +221,22 @@ class DownloadForegroundService : Service(), ProgressListener {
         const val ACTION_ADD_HTTP = "com.mdm.android.ADD_HTTP"
         const val ACTION_ADD_MAGNET = "com.mdm.android.ADD_MAGNET"
         const val ACTION_ADD_HLS = "com.mdm.android.ADD_HLS"
+        const val ACTION_ADD_YOUTUBE = "com.mdm.android.ADD_YOUTUBE"
+        const val ACTION_PAUSE_YOUTUBE = "com.mdm.android.PAUSE_YOUTUBE"
+        const val ACTION_RESUME_YOUTUBE = "com.mdm.android.RESUME_YOUTUBE"
+        const val ACTION_REMOVE_YOUTUBE = "com.mdm.android.REMOVE_YOUTUBE"
+        const val ACTION_UPDATE_YTDLP = "com.mdm.android.UPDATE_YTDLP"
         const val ACTION_EXIT = "com.mdm.android.EXIT"
         const val EXTRA_URL = "extra_url"
         const val EXTRA_FILENAME = "extra_filename"
+        const val EXTRA_TASK_ID = "extra_task_id"
+        const val EXTRA_DELETE_FILES = "extra_delete_files"
 
         /** 是否有“所有文件访问权限”（Android 11+）。 */
-        fun hasAllFilesAccess(context: Context): Boolean {
-            return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                Environment.isExternalStorageManager()
-            } else {
-                false
-            }
-        }
+        fun hasAllFilesAccess(context: Context): Boolean =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) Environment.isExternalStorageManager() else false
 
-        /**
-         * 下载保存目录：选了“手机存储”且有所有文件访问权限时用公共 Download/MDM
-         * （文件管理器可见），否则回落到应用私有目录，保证下载不断。
-         */
+        /** 下载保存目录；无权限时回落至应用私有目录。 */
         fun resolveDownloadDir(context: Context): File {
             val prefs = context.getSharedPreferences("mdm_settings", Context.MODE_PRIVATE)
             val wantPublic = prefs.getString("download_location", "public") != "private"

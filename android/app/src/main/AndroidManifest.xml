@@ -15,7 +15,8 @@
         android:supportsRtl="true"
         android:theme="@android:style/Theme.Material.Light.NoActionBar"
         android:icon="@mipmap/ic_launcher"
-        android:roundIcon="@mipmap/ic_launcher">
+        android:roundIcon="@mipmap/ic_launcher"
+        android:extractNativeLibs="true">
 
         <provider
             android:name="androidx.core.content.FileProvider"
