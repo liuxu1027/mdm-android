@@ -26,8 +26,7 @@ data class YoutubeMediaEntry(
     val url: String,
     val durationSeconds: Double?,
     val formats: List<YoutubeMediaFormat>,
-    val subtitleLanguages: List<String>,
-    val automaticSubtitleLanguages: List<String>
+    val subtitleLanguages: List<String>
 )
 
 data class YoutubeResolveResult(
@@ -148,8 +147,7 @@ object YoutubeMediaResolver {
             url = url,
             durationSeconds = node.decimal("duration"),
             formats = formats,
-            subtitleLanguages = languageKeys(node.optJSONObject("subtitles")),
-            automaticSubtitleLanguages = languageKeys(node.optJSONObject("automatic_captions"))
+            subtitleLanguages = languageKeys(node.optJSONObject("subtitles"))
         )
     }
 
@@ -180,7 +178,7 @@ object YoutubeMediaResolver {
     }
 
     private fun chooseSubtitle(entry: YoutubeMediaEntry, override: String?): String? {
-        val all = (entry.subtitleLanguages + entry.automaticSubtitleLanguages).distinct()
+        val all = entry.subtitleLanguages
         if (override == "") return null
         if (override != null) return all.firstOrNull { it.equals(override, ignoreCase = true) }
         return all.firstOrNull { it.startsWith("zh", ignoreCase = true) }

@@ -231,7 +231,6 @@ class YoutubeDownloadManager(
                     addOption("-f", formatSelector)
                     if (!subtitleLanguage.isNullOrBlank()) {
                         addOption("--write-subs")
-                        addOption("--write-auto-subs")
                         addOption("--sub-langs", subtitleLanguage)
                         addOption("--sub-format", "vtt/best")
                     }

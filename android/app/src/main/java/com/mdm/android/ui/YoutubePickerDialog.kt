@@ -60,10 +60,14 @@ fun YoutubePickerDialog(
         }
     }
     val subtitleOptions: List<ChoiceOption<String?>> = remember(result) {
-        listOf(
-            ChoiceOption<String?>("自动（中文优先）", null),
-            ChoiceOption<String?>("不下载字幕", "")
-        ) + state.subtitleLanguages.map { ChoiceOption(it, it) }
+        if (state.subtitleLanguages.isEmpty()) {
+            listOf(ChoiceOption<String?>("无字幕", ""))
+        } else {
+            listOf(
+                ChoiceOption<String?>("默认（中文优先）", null),
+                ChoiceOption<String?>("不下载字幕", "")
+            ) + state.subtitleLanguages.map { ChoiceOption(it, it) }
+        }
     }
     var selectedHeight by remember(result) { mutableIntStateOf(-1) }
     var selectedAudio by remember(result) { mutableIntStateOf(-1) }
@@ -235,7 +239,7 @@ private fun YoutubeEntryRow(
     onCheckedChange: (Boolean) -> Unit
 ) {
     val bestHeight = entry.formats.mapNotNull { it.height }.maxOrNull() ?: 0
-    val subtitles = (entry.subtitleLanguages + entry.automaticSubtitleLanguages).distinct()
+    val subtitles = entry.subtitleLanguages.distinct()
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -259,13 +263,6 @@ private fun YoutubeEntryRow(
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
-            if (subtitles.isEmpty()) {
-                Text(
-                    text = "无字幕，不进行转写",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
         }
     }
 }
@@ -288,7 +285,7 @@ private class PickerState(result: YoutubeResolveResult, ffmpegEnabled: Boolean) 
         .sortedDescending()
         .take(8)
     val subtitleLanguages: List<String> = entries
-        .flatMap { it.subtitleLanguages + it.automaticSubtitleLanguages }
+        .flatMap { it.subtitleLanguages }
         .distinct()
         .sortedWith(compareBy<String> { !it.startsWith("zh", ignoreCase = true) }
             .thenBy { !it.startsWith("en", ignoreCase = true) }
