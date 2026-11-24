@@ -92,7 +92,7 @@ class TaskStore(context: Context) :
      */
     fun saveThrottled(tasks: List<DownloadTask>) {
         val sig = tasks.sortedBy { it.id }
-            .joinToString("|") { "${it.id}:${it.state.name}" }
+            .joinToString("|") { "${it.id}:${it.state.name}:${it.title}:${it.savePath}" }
         val now = SystemClock.elapsedRealtime()
         if (sig != lastSignature) {
             lastSignature = sig
@@ -109,7 +109,7 @@ class TaskStore(context: Context) :
     fun saveNow(tasks: List<DownloadTask>) {
         lastSavedAtMs = SystemClock.elapsedRealtime()
         lastSignature = tasks.sortedBy { it.id }
-            .joinToString("|") { "${it.id}:${it.state.name}" }
+            .joinToString("|") { "${it.id}:${it.state.name}:${it.title}:${it.savePath}" }
         saveAllInternal(tasks)
     }
 

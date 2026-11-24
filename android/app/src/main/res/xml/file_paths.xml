@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <external-path name="public_mdm_downloads" path="Download/MDM/" />
+    <external-files-path name="app_external_downloads" path="downloads/" />
+    <files-path name="app_private_downloads" path="downloads/" />
+</paths>

@@ -700,6 +700,70 @@ impl DownloadEngine {
         Ok(())
     }
 
+    /// Rename a completed HTTP/HLS download and persist its new path/title.
+    /// Active downloads and torrent directories are intentionally left unchanged.
+    pub fn rename_task(&self, id: String, new_title: String) -> Result<(), MdmError> {
+        let requested = clean_filename(Some(new_title))
+            .filter(|name| name != "." && name != ".." && !name.chars().any(char::is_control))
+            .ok_or_else(|| MdmError::InvalidInput {
+                reason: "文件名无效".into(),
+            })?;
+        let mut tasks = self.tasks.lock().map_err(|_| MdmError::Engine {
+            reason: "任务列表暂不可用".into(),
+        })?;
+        let task = tasks
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| MdmError::NotFound { id: id.clone() })?;
+        if task.state != DownloadState::Completed {
+            return Err(MdmError::Engine {
+                reason: "请等待下载完成后再重命名".into(),
+            });
+        }
+        if !matches!(task.kind, DownloadKind::Http | DownloadKind::Hls) {
+            return Err(MdmError::Engine {
+                reason: "当前仅支持重命名已完成的 HTTP/HLS 文件".into(),
+            });
+        }
+
+        let source = PathBuf::from(&task.save_path);
+        if source.parent() != Some(self.download_dir.as_path()) || !source.is_file() {
+            return Err(MdmError::Storage {
+                reason: "找不到下载文件，无法重命名".into(),
+            });
+        }
+        let destination = source.with_file_name(&requested);
+        if source == destination {
+            return Ok(());
+        }
+        if destination.exists() {
+            return Err(MdmError::Storage {
+                reason: "同名文件已存在，请换一个名称".into(),
+            });
+        }
+        std::fs::rename(&source, &destination).map_err(|e| MdmError::Storage {
+            reason: format!("重命名失败: {e}"),
+        })?;
+
+        // 文件已完成，不再需要旧名称对应的断点/分片状态文件。
+        match task.kind {
+            DownloadKind::Http => {
+                let _ = std::fs::remove_file(mdm_engine::state::state_path(&source));
+            }
+            DownloadKind::Hls => {
+                let _ = std::fs::remove_file(hls::progress_path(&source));
+            }
+            _ => {}
+        }
+        if let Some(updated) = tasks.get_mut(&id) {
+            updated.title = requested;
+            updated.save_path = destination.to_string_lossy().to_string();
+        }
+        drop(tasks);
+        notify_all(&self.tasks, &self.listener);
+        Ok(())
+    }
+
     pub fn list_tasks(&self) -> Vec<DownloadTask> {
         self.tasks
             .lock()

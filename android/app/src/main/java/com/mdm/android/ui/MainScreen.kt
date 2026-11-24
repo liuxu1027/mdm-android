@@ -6,20 +6,22 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
+import android.webkit.MimeTypeMap
+import android.widget.Toast
+import androidx.core.content.FileProvider
+import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Clear
-import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.ExitToApp
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
@@ -29,6 +31,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -36,6 +39,7 @@ import com.mdm.android.service.DownloadForegroundService
 import uniffi.mdm_android.DownloadKind
 import uniffi.mdm_android.DownloadState
 import uniffi.mdm_android.DownloadTask
+import java.io.File
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -47,6 +51,10 @@ fun MainScreen(viewModel: MainViewModel) {
     var showExitConfirm by remember { mutableStateOf(false) }
     var showStorageDialog by remember { mutableStateOf(false) }
     var pendingRemoveId by remember { mutableStateOf<String?>(null) }
+    var selectedTaskId by remember { mutableStateOf<String?>(null) }
+    var renamingTaskId by remember { mutableStateOf<String?>(null) }
+    var renameValue by remember { mutableStateOf("") }
+    var renameError by remember { mutableStateOf<String?>(null) }
     val context = LocalContext.current
     val hasActiveDownload = tasks.any { it.state == DownloadState.DOWNLOADING }
 
@@ -125,55 +133,20 @@ fun MainScreen(viewModel: MainViewModel) {
                     Text("点击右下角 + 添加 HTTP、磁力或 m3u8 视频链接", style = MaterialTheme.typography.bodyMedium)
                 }
             } else {
-                LazyColumn(
+                LazyVerticalGrid(
+                    columns = GridCells.Fixed(2),
                     modifier = Modifier.fillMaxSize(),
-                    // 底部多留 88dp：列表滚到底时最后一行能顶到悬浮 + 按钮上面去，删除按钮不再被盖住。
-                    contentPadding = PaddingValues(start = 16.dp, top = 16.dp, end = 16.dp, bottom = 88.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                    // 双列紧凑卡片，底部为悬浮添加按钮留出空间。
+                    contentPadding = PaddingValues(start = 8.dp, top = 12.dp, end = 8.dp, bottom = 88.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     items(filteredTasks, key = { it.id }) { task ->
-                        // 左滑或右滑都弹出同一个三选一删除框；滑动本身不删东西，框里选了才删。
-                        val dismissState = rememberSwipeToDismissBoxState(
-                            confirmValueChange = { value ->
-                                if (value == SwipeToDismissBoxValue.StartToEnd ||
-                                    value == SwipeToDismissBoxValue.EndToStart
-                                ) {
-                                    pendingRemoveId = task.id
-                                }
-                                false
-                            }
-                        )
-                        SwipeToDismissBox(
-                            state = dismissState,
-                            backgroundContent = {
-                                val alignment = when (dismissState.dismissDirection) {
-                                    SwipeToDismissBoxValue.StartToEnd -> Alignment.CenterStart
-                                    else -> Alignment.CenterEnd
-                                }
-                                Box(
-                                    modifier = Modifier.fillMaxSize()
-                                        .background(
-                                            MaterialTheme.colorScheme.errorContainer,
-                                            RoundedCornerShape(12.dp)
-                                        )
-                                        .padding(horizontal = 20.dp),
-                                    contentAlignment = alignment
-                                ) {
-                                    Icon(
-                                        Icons.Default.Delete,
-                                        contentDescription = "删除",
-                                        tint = MaterialTheme.colorScheme.onErrorContainer
-                                    )
-                                }
-                            },
-                            content = {
-                                DownloadTaskCard(
-                                    task = task,
-                                    onPause = { viewModel.pause(task.id) },
-                                    onResume = { viewModel.resume(task.id) },
-                                    onRemove = { pendingRemoveId = task.id }
-                                )
-                            }
+                        DownloadTaskCard(
+                            task = task,
+                            onClick = { selectedTaskId = task.id },
+                            onPause = { viewModel.pause(task.id) },
+                            onResume = { viewModel.resume(task.id) }
                         )
                     }
                 }
@@ -277,59 +250,138 @@ fun MainScreen(viewModel: MainViewModel) {
             }
         )
     }
+
+    val selectedTask = tasks.firstOrNull { it.id == selectedTaskId }
+    if (selectedTask != null) {
+        AlertDialog(
+            onDismissRequest = { selectedTaskId = null },
+            title = { Text(selectedTask.title, maxLines = 2, overflow = TextOverflow.Ellipsis) },
+            text = {
+                Column {
+                    TextButton(
+                        onClick = {
+                            selectedTaskId = null
+                            openDownloadedFile(context, selectedTask)
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("打开", modifier = Modifier.fillMaxWidth()) }
+                    TextButton(
+                        onClick = {
+                            renameValue = selectedTask.title
+                            renameError = null
+                            renamingTaskId = selectedTask.id
+                            selectedTaskId = null
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("重命名", modifier = Modifier.fillMaxWidth()) }
+                    TextButton(
+                        onClick = {
+                            pendingRemoveId = selectedTask.id
+                            selectedTaskId = null
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)
+                    ) { Text("删除", modifier = Modifier.fillMaxWidth()) }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { selectedTaskId = null }) { Text("取消") }
+            }
+        )
+    }
+
+    val renamingTask = tasks.firstOrNull { it.id == renamingTaskId }
+    if (renamingTask != null) {
+        AlertDialog(
+            onDismissRequest = { renamingTaskId = null },
+            title = { Text("重命名") },
+            text = {
+                Column {
+                    OutlinedTextField(
+                        value = renameValue,
+                        onValueChange = { renameValue = it },
+                        label = { Text("文件名") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        "仅支持已完成的 HTTP/HLS 文件；可自行保留或修改扩展名。",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    if (renameError != null) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            renameError!!,
+                            color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val error = viewModel.rename(renamingTask.id, renameValue)
+                        .exceptionOrNull()?.message
+                    if (error == null) {
+                        renamingTaskId = null
+                    } else {
+                        renameError = error
+                    }
+                }) { Text("保存") }
+            },
+            dismissButton = {
+                TextButton(onClick = { renamingTaskId = null }) { Text("取消") }
+            }
+        )
+    }
 }
 
 @Composable
 private fun DownloadTaskCard(
     task: DownloadTask,
+    onClick: () -> Unit,
     onPause: () -> Unit,
-    onResume: () -> Unit,
-    onRemove: () -> Unit
+    onResume: () -> Unit
 ) {
     val progress = if (task.totalBytes > 0uL) {
         (task.downloadedBytes.toFloat() / task.totalBytes.toFloat()).coerceIn(0f, 1f)
     } else 0f
-    // 进度条平滑动画：引擎一批一批汇报进度，数值会跳；条和“已下载多少 MB”都跟着动画匀速走，看着就是线性的。
-    // 动画 600ms 内一定追上真实值，所以暂停/完成时显示的还是实打实的值。
+    // 引擎每 0.5-1 秒上报一次；用略短于上报周期的线性动画平滑追赶，避免显示滞后。
     val animatedProgress by animateFloatAsState(
         targetValue = progress,
-        animationSpec = tween(durationMillis = 600),
+        animationSpec = tween(durationMillis = 420, easing = LinearEasing),
         label = "downloadProgress"
     )
-    // 跟着动画走的已下载字节数：和进度条、百分比同步滑动，不再一下跳 10MB、18MB、23MB。
     val animatedBytes = (animatedProgress * task.totalBytes.toFloat()).toLong()
 
-    Card(modifier = Modifier.fillMaxWidth()) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    text = task.title,
-                    style = MaterialTheme.typography.titleMedium,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f)
-                )
-                AssistChip(
-                    onClick = {},
-                    label = {
-                        Text(
-                            when (task.kind) {
-                                DownloadKind.HTTP -> "HTTP"
-                                DownloadKind.TORRENT_MAGNET -> "Magnet"
-                                DownloadKind.TORRENT_FILE -> "Torrent"
-                                DownloadKind.HLS -> "视频"
-                            }
-                        )
-                    }
-                )
-            }
-            Spacer(modifier = Modifier.height(8.dp))
-            LinearProgressIndicator(progress = { animatedProgress }, modifier = Modifier.fillMaxWidth())
-            Spacer(modifier = Modifier.height(4.dp))
+    Card(onClick = onClick, modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Text(
+                text = task.title,
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.Medium,
+                maxLines = 2,
+                minLines = 2,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                text = when (task.kind) {
+                    DownloadKind.HTTP -> "HTTP"
+                    DownloadKind.TORRENT_MAGNET -> "Magnet"
+                    DownloadKind.TORRENT_FILE -> "Torrent"
+                    DownloadKind.HLS -> "视频"
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.primary
+            )
+            LinearProgressIndicator(
+                progress = { animatedProgress },
+                modifier = Modifier.fillMaxWidth().height(5.dp)
+            )
             Text(
                 text = if (task.totalBytes > 0uL) {
                     "${formatSize(animatedBytes)} / ${formatSize(task.totalBytes.toLong())} · ${(animatedProgress * 100).toInt()}%"
@@ -338,19 +390,19 @@ private fun DownloadTaskCard(
                 } else {
                     "等待开始…"
                 },
-                style = MaterialTheme.typography.bodySmall
+                style = MaterialTheme.typography.labelSmall,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis
             )
             if (task.errorMessage != null) {
-                Spacer(modifier = Modifier.height(4.dp))
                 Text(
                     text = task.errorMessage!!,
-                    style = MaterialTheme.typography.bodySmall,
+                    style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.error,
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis
                 )
             }
-            Spacer(modifier = Modifier.height(4.dp))
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -358,24 +410,22 @@ private fun DownloadTaskCard(
             ) {
                 Text(
                     text = if (task.kind == DownloadKind.TORRENT_MAGNET || task.kind == DownloadKind.TORRENT_FILE) {
-                        "${task.state.name} · ↓ ${formatSpeed(task.speedBytesPerSec.toLong())} · ↑ ${formatSpeed(task.uploadSpeedBytesPerSec.toLong())}"
+                        "${stateLabel(task.state)} · ↓${formatSpeed(task.speedBytesPerSec.toLong())}"
                     } else {
-                        "${task.state.name} · ${formatSpeed(task.speedBytesPerSec.toLong())}"
+                        "${stateLabel(task.state)} · ${formatSpeed(task.speedBytesPerSec.toLong())}"
                     },
-                    style = MaterialTheme.typography.bodySmall
+                    style = MaterialTheme.typography.labelSmall,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
                 )
-                Row {
-                    if (task.state == DownloadState.DOWNLOADING) {
-                        IconButton(onClick = onPause) {
-                            Icon(Icons.Default.Pause, contentDescription = "暂停")
-                        }
-                    } else if (task.state == DownloadState.PAUSED || task.state == DownloadState.FAILED) {
-                        IconButton(onClick = onResume) {
-                            Icon(Icons.Default.PlayArrow, contentDescription = "继续")
-                        }
+                if (task.state == DownloadState.DOWNLOADING) {
+                    IconButton(onClick = onPause, modifier = Modifier.size(32.dp)) {
+                        Icon(Icons.Default.Pause, contentDescription = "暂停")
                     }
-                    IconButton(onClick = onRemove) {
-                        Icon(Icons.Default.Delete, contentDescription = "删除")
+                } else if (task.state == DownloadState.PAUSED || task.state == DownloadState.FAILED) {
+                    IconButton(onClick = onResume, modifier = Modifier.size(32.dp)) {
+                        Icon(Icons.Default.PlayArrow, contentDescription = "继续")
                     }
                 }
             }
@@ -383,10 +433,61 @@ private fun DownloadTaskCard(
     }
 }
 
+private fun stateLabel(state: DownloadState): String = when (state) {
+    DownloadState.QUEUED -> "排队中"
+    DownloadState.DOWNLOADING -> "下载中"
+    DownloadState.PAUSED -> "已暂停"
+    DownloadState.COMPLETED -> "已完成"
+    DownloadState.FAILED -> "失败"
+}
+
+private fun openDownloadedFile(context: Context, task: DownloadTask) {
+    val taskPath = File(task.savePath)
+    val file = if (taskPath.isDirectory) findPlayableFile(taskPath) else taskPath
+    if (file == null || !file.exists()) {
+        Toast.makeText(context, "暂未找到可打开的下载文件", Toast.LENGTH_SHORT).show()
+        return
+    }
+    try {
+        val uri = FileProvider.getUriForFile(
+            context,
+            "${context.packageName}.fileprovider",
+            file
+        )
+        val extension = file.extension.lowercase()
+        val mimeType = MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension) ?: "*/*"
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, mimeType)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        context.startActivity(intent)
+    } catch (_: Exception) {
+        Toast.makeText(context, "没有可打开此文件的应用", Toast.LENGTH_SHORT).show()
+    }
+}
+
+private fun findPlayableFile(root: File): File? {
+    val playableExtensions = setOf("mp4", "mkv", "webm", "mov", "avi", "ts", "m4v", "mp3", "m4a", "aac", "flac", "wav", "ogg")
+    val pending = java.util.ArrayDeque<File>()
+    pending.add(root)
+    var inspected = 0
+    while (pending.isNotEmpty() && inspected < 300) {
+        val current = pending.removeFirst()
+        inspected++
+        if (current.isFile) {
+            if (current.extension.lowercase() in playableExtensions) return current
+        } else {
+            current.listFiles()?.sortedBy { it.name }?.take(40)?.forEach(pending::addLast)
+        }
+    }
+    return null
+}
+
 @Composable
 private fun AddLinkDialog(onDismiss: () -> Unit, onConfirm: (String, String?) -> Unit) {
     var text by remember { mutableStateOf("") }
     var fileName by remember { mutableStateOf("") }
+    var inputError by remember { mutableStateOf<String?>(null) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("新建下载任务") },
@@ -394,8 +495,11 @@ private fun AddLinkDialog(onDismiss: () -> Unit, onConfirm: (String, String?) ->
             Column {
                 OutlinedTextField(
                     value = text,
-                    onValueChange = { text = it },
-                    label = { Text("输入 HTTP/HTTPS、magnet:? 或 .m3u8 链接") },
+                    onValueChange = {
+                        text = it
+                        inputError = null
+                    },
+                    label = { Text("输入 HTTP/HTTPS 直链、magnet:? 或 .m3u8 链接") },
                     singleLine = false,
                     maxLines = 4,
                     modifier = Modifier.fillMaxWidth()
@@ -408,20 +512,42 @@ private fun AddLinkDialog(onDismiss: () -> Unit, onConfirm: (String, String?) ->
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
+                if (inputError != null) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        inputError!!,
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    "同名文件已存在时，会在名字后面加随机字母，不会顶掉已下完的文件",
+                    "同名文件已存在时，会在名字后面加随机字母，不会顶掉已下完的文件。YouTube 页面链接暂不支持直接下载。",
                     style = MaterialTheme.typography.bodySmall
                 )
             }
         },
         confirmButton = {
-            TextButton(onClick = { onConfirm(text, fileName.ifBlank { null }) }) { Text("开始下载") }
+            TextButton(onClick = {
+                if (isYouTubePageLink(text)) {
+                    inputError = "YouTube 页面链接不是可下载的直链，当前版本暂不支持解析。"
+                } else {
+                    onConfirm(text, fileName.ifBlank { null })
+                }
+            }) { Text("开始下载") }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) { Text("取消") }
         }
     )
+}
+
+private fun isYouTubePageLink(input: String): Boolean {
+    val value = input.trim()
+    if (value.isEmpty()) return false
+    val withScheme = if (value.contains("://")) value else "https://$value"
+    val host = runCatching { Uri.parse(withScheme).host?.lowercase() }.getOrNull() ?: return false
+    return host == "youtu.be" || host == "youtube.com" || host.endsWith(".youtube.com")
 }
 
 private fun formatSpeed(bytesPerSec: Long): String = when {
