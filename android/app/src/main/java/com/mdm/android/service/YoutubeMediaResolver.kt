@@ -57,23 +57,29 @@ object YoutubeMediaResolver {
 
     suspend fun resolve(context: Context, url: String): YoutubeResolveResult = withContext(Dispatchers.IO) {
         initRuntime(context)
-        val isPlaylistUrl = url.contains("list=", ignoreCase = true) ||
-            url.contains("/playlist", ignoreCase = true)
-        val request = YoutubeDLRequest(url).apply {
-            addOption("--dump-single-json")
-            addOption("--skip-download")
-            addOption("--no-warnings")
-            addOption("--ignore-errors")
-            // Playlist entries need only their flat IDs/titles here; resolving every format
-            // individually made large lists take minutes and is unnecessary for selection.
-            if (isPlaylistUrl) addOption("--flat-playlist")
+        val cookieFile = YoutubeCookieStore.createTemporaryCookieFile(context.applicationContext)
+        try {
+            val isPlaylistUrl = url.contains("list=", ignoreCase = true) ||
+                url.contains("/playlist", ignoreCase = true)
+            val request = YoutubeDLRequest(url).apply {
+                addOption("--dump-single-json")
+                addOption("--skip-download")
+                addOption("--no-warnings")
+                addOption("--ignore-errors")
+                cookieFile?.let { addOption("--cookies", it.absolutePath) }
+                // Playlist entries need only their flat IDs/titles here; resolving every format
+                // individually made large lists take minutes and is unnecessary for selection.
+                if (isPlaylistUrl) addOption("--flat-playlist")
+            }
+            val response = YoutubeDL.getInstance().execute(request)
+            val output = response.out.orEmpty()
+            check(output.isNotBlank()) { "yt-dlp 未返回解析信息" }
+            val result = parseResult(JSONObject(output), url)
+            check(result.entries.isNotEmpty()) { "解析结果中没有可下载的视频" }
+            result
+        } finally {
+            YoutubeCookieStore.deleteTemporaryCookieFile(cookieFile)
         }
-        val response = YoutubeDL.getInstance().execute(request)
-        val output = response.out.orEmpty()
-        check(output.isNotBlank()) { "yt-dlp 未返回解析信息" }
-        val result = parseResult(JSONObject(output), url)
-        check(result.entries.isNotEmpty()) { "解析结果中没有可下载的视频" }
-        result
     }
 
     fun directSpec(

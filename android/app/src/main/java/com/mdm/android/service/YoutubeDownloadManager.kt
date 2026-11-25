@@ -212,6 +212,7 @@ class YoutubeDownloadManager(
         if (oldJob?.isActive == true) return
         removedIds.remove(id)
         val job = scope.launch(start = CoroutineStart.LAZY) {
+            var temporaryCookieFile: File? = null
             try {
                 YoutubeDL.getInstance().init(appContext)
                 YoutubeRuntime.init(appContext)
@@ -246,6 +247,7 @@ class YoutubeDownloadManager(
                 } else {
                     File(outputBase, "${prefix.replace("%", "%%")}%(title).160B.%(ext)s").absolutePath
                 }
+                temporaryCookieFile = YoutubeCookieStore.createTemporaryCookieFile(appContext)
                 val request = YoutubeDLRequest(source).apply {
                     addOption("--no-playlist")
                     addOption("--no-warnings")
@@ -253,6 +255,7 @@ class YoutubeDownloadManager(
                     addOption("--newline")
                     addOption("-f", formatSelector)
                     addOption("-o", outputTemplate)
+                    temporaryCookieFile?.let { addOption("--cookies", it.absolutePath) }
                 }
                 val processId = "mdm-ytdlp-${id}-${System.nanoTime()}"
                 processIds[id] = processId
@@ -353,6 +356,7 @@ class YoutubeDownloadManager(
                     }
                 }
             } finally {
+                YoutubeCookieStore.deleteTemporaryCookieFile(temporaryCookieFile)
                 processIds.entries.removeIf { it.key == id }
                 jobs.remove(id)
                 startQueuedTasks()
@@ -364,18 +368,24 @@ class YoutubeDownloadManager(
 
     private suspend fun downloadSubtitle(source: String, language: String, outputTemplate: String) {
         runCatching {
-            val request = YoutubeDLRequest(source).apply {
-                addOption("--no-playlist")
-                addOption("--no-warnings")
-                addOption("--ignore-errors")
-                addOption("--skip-download")
-                addOption("--write-subs")
-                addOption("--write-auto-subs")
-                addOption("--sub-langs", language)
-                addOption("--sub-format", "vtt/best")
-                addOption("-o", outputTemplate)
+            val cookieFile = YoutubeCookieStore.createTemporaryCookieFile(appContext)
+            try {
+                val request = YoutubeDLRequest(source).apply {
+                    addOption("--no-playlist")
+                    addOption("--no-warnings")
+                    addOption("--ignore-errors")
+                    addOption("--skip-download")
+                    addOption("--write-subs")
+                    addOption("--write-auto-subs")
+                    addOption("--sub-langs", language)
+                    addOption("--sub-format", "vtt/best")
+                    addOption("-o", outputTemplate)
+                    cookieFile?.let { addOption("--cookies", it.absolutePath) }
+                }
+                YoutubeDL.getInstance().execute(request)
+            } finally {
+                YoutubeCookieStore.deleteTemporaryCookieFile(cookieFile)
             }
-            YoutubeDL.getInstance().execute(request)
         }
     }
 

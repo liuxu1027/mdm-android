@@ -49,6 +49,7 @@ import kotlinx.coroutines.withContext
 import com.mdm.android.service.DownloadForegroundService
 import com.mdm.android.service.YoutubeRuntime
 import com.mdm.android.service.YoutubeMediaResolver
+import com.mdm.android.service.YoutubeCookieStore
 import uniffi.mdm_android.DownloadKind
 import uniffi.mdm_android.DownloadState
 import uniffi.mdm_android.DownloadTask
@@ -967,6 +968,57 @@ private fun SettingsDialog(
     onCheckYtDlpUpdates: () -> Unit,
     onDismiss: () -> Unit
 ) {
+    val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
+    var hasStoredCookieData by remember { mutableStateOf(YoutubeCookieStore.hasAnyCookieData(context)) }
+    var hasYoutubeCookies by remember { mutableStateOf(false) }
+    var checkingCookieStore by remember { mutableStateOf(true) }
+    var youtubeCookiesEnabled by remember { mutableStateOf(false) }
+    var youtubeCookieCount by remember { mutableIntStateOf(YoutubeCookieStore.cookieCount(context)) }
+    var cookieNotice by remember { mutableStateOf<String?>(null) }
+    var importingCookieFile by remember { mutableStateOf(false) }
+    var clearingCookieData by remember { mutableStateOf(false) }
+    var updatingCookieSetting by remember { mutableStateOf(false) }
+    LaunchedEffect(context) {
+        val (flags, count) = withContext(Dispatchers.IO) {
+            Pair(
+                Triple(
+                    YoutubeCookieStore.hasAnyCookieData(context),
+                    YoutubeCookieStore.hasCookies(context),
+                    YoutubeCookieStore.isEnabled(context)
+                ),
+                YoutubeCookieStore.cookieCount(context)
+            )
+        }
+        hasStoredCookieData = flags.first
+        hasYoutubeCookies = flags.second
+        youtubeCookiesEnabled = flags.third
+        youtubeCookieCount = count
+        checkingCookieStore = false
+    }
+    val cookieFilePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            coroutineScope.launch {
+                importingCookieFile = true
+                val result = withContext(Dispatchers.IO) {
+                    runCatching {
+                        val count = YoutubeCookieStore.importFile(context, uri)
+                        count to YoutubeCookieStore.isEnabled(context)
+                    }
+                }
+                importingCookieFile = false
+                result.onSuccess { (count, enabled) ->
+                    hasStoredCookieData = true
+                    hasYoutubeCookies = true
+                    youtubeCookieCount = count
+                    youtubeCookiesEnabled = enabled
+                    cookieNotice = "已加密导入 $count 个 YouTube/Google Cookie；${if (youtubeCookiesEnabled) "已启用" else "尚未启用"}。"
+                }.onFailure { error ->
+                    cookieNotice = error.message ?: "Cookie 文件导入失败"
+                }
+            }
+        }
+    }
     val speedOptions = listOf(
         0L to "不限速",
         512L * 1024 to "500 KB/s",
@@ -1166,6 +1218,101 @@ private fun SettingsDialog(
                 }
                 if (youtubeEnabled) {
                     Column {
+                        Text("YouTube 登录 Cookie", style = MaterialTheme.typography.titleSmall)
+                        Text(
+                            when {
+                                checkingCookieStore -> "正在检查本机 Cookie…"
+                                hasYoutubeCookies ->
+                                    "已导入 $youtubeCookieCount 个 YouTube/Google Cookie · ${if (youtubeCookiesEnabled) "已启用" else "已停用"}"
+                                hasStoredCookieData -> "本机存在 Cookie 数据或残留临时副本，但当前不可用；可重新导入或清除。"
+                                else -> "尚未导入 Cookie 文件"
+                            },
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("用于需要登录的 YouTube 下载", style = MaterialTheme.typography.bodyMedium)
+                                Text("停用只影响新请求；已开始的请求可能继续使用临时副本。", style = MaterialTheme.typography.bodySmall)
+                            }
+                            Switch(
+                                checked = youtubeCookiesEnabled && hasYoutubeCookies,
+                                enabled = hasYoutubeCookies && !checkingCookieStore && !updatingCookieSetting &&
+                                    !clearingCookieData && !importingCookieFile,
+                                onCheckedChange = { enabled ->
+                                    coroutineScope.launch {
+                                        updatingCookieSetting = true
+                                        val result = withContext(Dispatchers.IO) {
+                                            runCatching {
+                                                YoutubeCookieStore.setEnabled(context, enabled)
+                                                YoutubeCookieStore.isEnabled(context)
+                                            }
+                                        }
+                                        updatingCookieSetting = false
+                                        result.onSuccess { isEnabled ->
+                                            youtubeCookiesEnabled = isEnabled
+                                            cookieNotice = if (isEnabled) {
+                                                "已启用 Cookie，用于之后开始的请求。"
+                                            } else {
+                                                "已停用 Cookie，用于之后开始的请求。"
+                                            }
+                                        }.onFailure {
+                                            cookieNotice = it.message ?: "Cookie 设置更新失败"
+                                        }
+                                    }
+                                }
+                            )
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedButton(
+                                onClick = { cookieFilePicker.launch(arrayOf("text/*", "application/octet-stream")) },
+                                enabled = !importingCookieFile && !clearingCookieData
+                            ) {
+                                Text(if (importingCookieFile) "正在导入…" else "导入 cookies.txt")
+                            }
+                            TextButton(
+                                onClick = {
+                                    coroutineScope.launch {
+                                        clearingCookieData = true
+                                        val result = withContext(Dispatchers.IO) {
+                                            runCatching { YoutubeCookieStore.clear(context) }
+                                        }
+                                        val (flags, count) = withContext(Dispatchers.IO) {
+                                            Pair(
+                                                Triple(
+                                                    YoutubeCookieStore.hasAnyCookieData(context),
+                                                    YoutubeCookieStore.hasCookies(context),
+                                                    YoutubeCookieStore.isEnabled(context)
+                                                ),
+                                                YoutubeCookieStore.cookieCount(context)
+                                            )
+                                        }
+                                        hasStoredCookieData = flags.first
+                                        hasYoutubeCookies = flags.second
+                                        youtubeCookiesEnabled = flags.third
+                                        youtubeCookieCount = count
+                                        clearingCookieData = false
+                                        cookieNotice = when {
+                                            result.isFailure -> result.exceptionOrNull()?.message ?: "清除 Cookie 失败"
+                                            result.getOrDefault(false) -> "已清除本机保存的 Cookie。"
+                                            else -> "Cookie 清理未能完全完成；请稍后重试，或重新导入。"
+                                        }
+                                    }
+                                },
+                                enabled = hasStoredCookieData && !clearingCookieData && !importingCookieFile
+                            ) {
+                                Text(if (clearingCookieData) "清除中…" else "清除")
+                            }
+                        }
+                        Text(
+                            "仅手动导入你本人已登录浏览器导出的 Netscape 格式文件。应用只保留 YouTube/Google 域名 Cookie，并用 Android Keystore 加密存于本机（不备份、不上传）。Cookie 等同登录凭据，请勿分享；此功能不提供内置登录，也不绕过验证码。清除会删除当前临时副本，进行中的登录请求可能失败。",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        cookieNotice?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+                        Spacer(modifier = Modifier.height(4.dp))
                         Text("yt-dlp 视频解析", style = MaterialTheme.typography.titleSmall)
                         Text(
                             "更新检查为手动操作，只使用 Stable，不会自动切换到 Nightly。",
