@@ -20,12 +20,17 @@ import com.mdm.android.service.YoutubeDownloadSpec
 import com.mdm.android.service.YoutubeMediaResolver
 import com.mdm.android.service.YoutubeResolveResult
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import uniffi.mdm_android.DownloadKind
 import uniffi.mdm_android.DownloadState
 import uniffi.mdm_android.DownloadTask
 import java.io.File
+import java.io.IOException
+import java.net.HttpURLConnection
+import java.net.URL
 
 sealed class YoutubeResolveUiState {
     object Idle : YoutubeResolveUiState()
@@ -253,6 +258,97 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
         ContextCompat.startForegroundService(ctx, intent)
+    }
+
+    /** 多行粘贴的添加结果。 */
+    data class AddLinksResult(val added: Int, val skippedYoutube: Int, val skippedSeries: Int)
+
+    /** 批量/剧集添加完成或失败后的一次性提示，由界面消费后清空。 */
+    var batchMessage by mutableStateOf<String?>(null)
+        private set
+
+    fun consumeBatchMessage() {
+        batchMessage = null
+    }
+
+    /**
+     * 多行粘贴：按行切分，一行一个任务。
+     * 只有一行时行为与 addLink 相同（文件名透传）；多行时文件名忽略，每行按链接取名。
+     * YouTube 链接和剧集页地址跳过不加（请逐条添加，剧集页请单独粘贴）。
+     */
+    fun addLinks(rawText: String, filename: String? = null): AddLinksResult {
+        val lines = rawText.lines().map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+        if (lines.isEmpty()) return AddLinksResult(0, 0, 0)
+        var added = 0
+        var skippedYoutube = 0
+        var skippedSeries = 0
+        for (line in lines) {
+            when {
+                isYouTubePageLink(line) -> skippedYoutube++
+                isPpnixSeriesPage(line) -> skippedSeries++
+                else -> {
+                    addLink(line, filename = if (lines.size == 1) filename else null)
+                    added++
+                }
+            }
+        }
+        return AddLinksResult(added, skippedYoutube, skippedSeries)
+    }
+
+    /** ppnix 剧集页：抓页面，读剧集编号，拼出各集地址后批量添加。 */
+    fun resolveSeriesPage(url: String) {
+        val pageUrl = url.trim()
+        viewModelScope.launch {
+            val episodes = runCatching {
+                withContext(Dispatchers.IO) {
+                    parsePpnixSeries(pageUrl, fetchText(pageUrl))
+                }
+            }
+            when {
+                episodes.isFailure -> {
+                    val reason = episodes.exceptionOrNull()?.message?.take(80)?.ifBlank { null }
+                    batchMessage = "读取剧集页失败：${reason ?: "网络错误"}"
+                }
+                episodes.getOrNull().isNullOrEmpty() -> {
+                    batchMessage = "这个页面里没有找到剧集，请确认链接"
+                }
+                else -> {
+                    val result = addLinks(episodes.getOrNull()!!.joinToString("\n"))
+                    batchMessage = "已添加 ${result.added} 集"
+                }
+            }
+        }
+    }
+
+    private fun fetchText(url: String): String {
+        val connection = URL(url).openConnection() as HttpURLConnection
+        connection.connectTimeout = 15000
+        connection.readTimeout = 15000
+        connection.setRequestProperty(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+        )
+        connection.setRequestProperty("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+        try {
+            val code = connection.responseCode
+            if (code !in 200..299) throw IOException("HTTP $code")
+            return connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    /** 从 ppnix 剧集页 HTML 里读出剧集编号，拼成各集 m3u8 地址。 */
+    private fun parsePpnixSeries(pageUrl: String, html: String): List<String> {
+        val id = Regex("""infoid\s*=\s*(\d+)""").find(html)?.groupValues?.getOrNull(1)
+            ?: return emptyList()
+        val listBody = Regex("""m3u8\s*=\s*\[([^\]]*)\]""").find(html)?.groupValues?.getOrNull(1)
+            ?: return emptyList()
+        val episodes = Regex("""'([^']+)'""").findAll(listBody).map { it.groupValues[1] }.toList()
+        if (episodes.isEmpty()) return emptyList()
+        val host = runCatching { Uri.parse(pageUrl).host }.getOrNull()?.takeIf { it.isNotBlank() }
+            ?: "www.ppnix.com"
+        return episodes.map { ep -> "https://$host/info/m3u8/$id/$ep.m3u8" }
     }
 
     fun resolveYoutubeLink(
