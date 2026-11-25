@@ -62,7 +62,8 @@ class YoutubeDownloadManager(
         url: String,
         requestedName: String?,
         formatSelector: String? = null,
-        subtitleLanguage: String? = null
+        subtitleLanguage: String? = null,
+        audioOnly: Boolean = false
     ): String {
         val id = UUID.randomUUID().toString()
         val cleanRequestedName = requestedName?.takeIf { it.isNotBlank() }?.let(::sanitizeBaseName)
@@ -71,6 +72,7 @@ class YoutubeDownloadManager(
         optionsPrefs.edit()
             .putString("$id.format", formatSelector?.takeIf { it.isNotBlank() } ?: DEFAULT_FORMAT)
             .putString("$id.subtitle", subtitleLanguage?.takeIf { it.isNotBlank() })
+            .putBoolean("$id.audio_only", audioOnly)
             .putString("$id.name", cleanRequestedName)
             .putString("$id.prefix", prefix)
             .apply()
@@ -101,7 +103,8 @@ class YoutubeDownloadManager(
             ?: File(old.savePath).takeIf { !old.savePath.endsWith(".pending") }?.nameWithoutExtension
         val format = optionsPrefs.getString("$id.format", DEFAULT_FORMAT)
         val subtitle = optionsPrefs.getString("$id.subtitle", null)
-        add(old.sourceUrl, name, format, subtitle)
+        val audioOnly = optionsPrefs.getBoolean("$id.audio_only", false)
+        add(old.sourceUrl, name, format, subtitle, audioOnly)
     }
 
     fun rename(id: String, requestedName: String): Result<Unit> = runCatching {
@@ -183,6 +186,7 @@ class YoutubeDownloadManager(
         optionsPrefs.edit()
             .remove("$id.format")
             .remove("$id.subtitle")
+            .remove("$id.audio_only")
             .remove("$id.name")
             .remove("$id.prefix")
             .apply()
@@ -228,6 +232,7 @@ class YoutubeDownloadManager(
                 val source = current.sourceUrl
                 val formatSelector = optionsPrefs.getString("$id.format", null) ?: DEFAULT_FORMAT
                 val subtitleLanguage = optionsPrefs.getString("$id.subtitle", null)
+                val audioOnly = optionsPrefs.getBoolean("$id.audio_only", false)
                 val requestedName = optionsPrefs.getString("$id.name", null)?.takeIf { it.isNotBlank() }
                 val prefix = optionsPrefs.getString("$id.prefix", null)
                     ?: File(current.savePath).nameWithoutExtension
@@ -262,6 +267,10 @@ class YoutubeDownloadManager(
                     addOption("--continue")
                     addOption("--newline")
                     addOption("-f", formatSelector)
+                    if (audioOnly) {
+                        addOption("-x")
+                        addOption("--audio-format", "m4a")
+                    }
                     addOption("-o", outputTemplate)
                     temporaryCookieFile?.let { addOption("--cookies", it.absolutePath) }
                 }
@@ -425,7 +434,7 @@ class YoutubeDownloadManager(
             .take(160)
             .trim()
         val suffix = cleaned.substringAfterLast('.', "").lowercase()
-        val withoutExtension = if (suffix in VIDEO_EXTENSIONS) cleaned.substringBeforeLast('.').trim() else cleaned
+        val withoutExtension = if (suffix in MEDIA_EXTENSIONS) cleaned.substringBeforeLast('.').trim() else cleaned
         return withoutExtension.ifBlank { "youtube_video" }
     }
 
@@ -462,7 +471,7 @@ class YoutubeDownloadManager(
         directory.listFiles()
             ?.filter { file ->
                 file.isFile && taskFileMatches(id, file.name, prefix) &&
-                    (file.name.endsWith(".part") || file.extension.lowercase() in VIDEO_EXTENSIONS)
+                    (file.name.endsWith(".part") || file.extension.lowercase() in MEDIA_EXTENSIONS)
             }
             ?.sumOf { it.length() }
             ?.coerceAtLeast(0L) ?: 0L
@@ -488,7 +497,7 @@ class YoutubeDownloadManager(
             ?.filter { file ->
                 file.isFile && taskFileMatches(id, file.name, prefix) &&
                     !file.name.endsWith(".part") && !file.name.endsWith(".ytdl") &&
-                    !file.name.endsWith(".info.json") && file.extension.lowercase() in VIDEO_EXTENSIONS
+                    !file.name.endsWith(".info.json") && file.extension.lowercase() in MEDIA_EXTENSIONS
             }
             ?.maxByOrNull { it.lastModified() }
 
@@ -511,6 +520,9 @@ class YoutubeDownloadManager(
 
     companion object {
         private const val DEFAULT_FORMAT = "best[ext=mp4]/best"
-        private val VIDEO_EXTENSIONS = setOf("mp4", "m4v", "webm", "mkv", "mov", "3gp", "flv")
+        private val MEDIA_EXTENSIONS = setOf(
+            "mp4", "m4v", "webm", "mkv", "mov", "3gp", "flv",
+            "m4a", "mp3", "aac", "flac", "wav", "ogg", "opus"
+        )
     }
 }

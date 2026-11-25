@@ -49,6 +49,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val prefs =
         application.getSharedPreferences("mdm_settings", Context.MODE_PRIVATE)
 
+    var themeStyle by mutableStateOf(
+        prefs.getString("theme_style", "default")?.takeIf { it == "minimalist" } ?: "default"
+    )
+        private set
+
     var youtubeResolveState by mutableStateOf<YoutubeResolveUiState>(YoutubeResolveUiState.Idle)
         private set
     private var youtubeResolveJob: kotlinx.coroutines.Job? = null
@@ -57,6 +62,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         private set
     var checkingYtDlpUpdate by mutableStateOf(false)
         private set
+
+    fun updateThemeStyle(value: String) {
+        val style = if (value == "minimalist") "minimalist" else "default"
+        themeStyle = style
+        prefs.edit().putString("theme_style", style).apply()
+    }
 
     /** 每任务默认连接数（1-16），新下载生效。 */
     var maxConnections by mutableStateOf(prefs.getInt("max_connections", 8))
@@ -228,7 +239,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 youtubeResolveState = YoutubeResolveUiState.Failed("此版本不支持该链接类型。")
                 return
             }
-            if (targetHeight != null && audioCeiling != null && !isYouTubePlaylistLink(trimmed)) {
+            if (audioCeiling != null && !isYouTubePlaylistLink(trimmed)) {
                 youtubeRequestedName = filename?.trim()?.takeIf { it.isNotBlank() }
                 val spec = YoutubeMediaResolver.directSpec(
                     url = trimmed,
@@ -397,6 +408,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             putStringArrayListExtra(DownloadForegroundService.EXTRA_YOUTUBE_NAMES, names)
             putStringArrayListExtra(DownloadForegroundService.EXTRA_YOUTUBE_FORMATS, ArrayList(specs.map { it.formatSelector }))
             putStringArrayListExtra(DownloadForegroundService.EXTRA_YOUTUBE_SUBTITLES, ArrayList(specs.map { it.subtitleLanguage.orEmpty() }))
+            putStringArrayListExtra(DownloadForegroundService.EXTRA_YOUTUBE_AUDIO_ONLY, ArrayList(specs.map { it.audioOnly.toString() }))
         }
         ContextCompat.startForegroundService(ctx, intent)
         dismissYoutubePicker()

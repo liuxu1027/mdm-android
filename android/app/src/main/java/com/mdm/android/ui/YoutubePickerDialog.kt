@@ -74,6 +74,9 @@ fun YoutubePickerDialog(
     var selectedHeight by remember(result, initialTargetHeight) {
         mutableIntStateOf(heights.indexOfFirst { it.height == initialTargetHeight })
     }
+    var selectedAudioOnly by remember(result, initialTargetHeight, initialAudioCeiling) {
+        mutableStateOf(initialTargetHeight == null && initialAudioCeiling != null)
+    }
     var selectedAudio by remember(result, initialAudioCeiling) {
         mutableIntStateOf(audioOptions.indexOfFirst { it.value == initialAudioCeiling }
             .takeIf { initialAudioCeiling != null } ?: -1)
@@ -82,9 +85,9 @@ fun YoutubePickerDialog(
     var selectedUrls by remember(result) {
         mutableStateOf(if (result.isPlaylist) emptySet() else result.entries.firstOrNull()?.url?.let { setOf(it) }.orEmpty())
     }
-    val canChooseVideos = selectedHeight >= 0 && selectedAudio >= 0
+    val canChooseVideos = (selectedAudioOnly || selectedHeight >= 0) && selectedAudio >= 0
     val canStart = canChooseVideos && selectedUrls.isNotEmpty()
-    val targetHeight = heights.getOrNull(selectedHeight)?.height
+    val targetHeight = if (selectedAudioOnly) null else heights.getOrNull(selectedHeight)?.height
     val audioCeiling = audioOptions.getOrNull(selectedAudio)?.value
 
     AlertDialog(
@@ -116,10 +119,22 @@ fun YoutubePickerDialog(
                     modifier = Modifier.horizontalScroll(rememberScrollState()),
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
+                    FilterChip(
+                        selected = selectedAudioOnly,
+                        enabled = ffmpegEnabled,
+                        onClick = {
+                            selectedAudioOnly = true
+                            selectedHeight = -1
+                        },
+                        label = { Text("仅音频 · m4a") }
+                    )
                     heights.forEachIndexed { index, option ->
                         FilterChip(
-                            selected = selectedHeight == index,
-                            onClick = { selectedHeight = index },
+                            selected = !selectedAudioOnly && selectedHeight == index,
+                            onClick = {
+                                selectedAudioOnly = false
+                                selectedHeight = index
+                            },
                             label = { Text(option.label) }
                         )
                     }
@@ -130,12 +145,16 @@ fun YoutubePickerDialog(
                     selectedIndex = selectedAudio,
                     onSelectedIndexChange = { selectedAudio = it }
                 )
-                ChoiceDropdown(
-                    title = "字幕",
-                    options = subtitleOptions,
-                    selectedIndex = selectedSubtitle,
-                    onSelectedIndexChange = { selectedSubtitle = it }
-                )
+                if (!selectedAudioOnly) {
+                    ChoiceDropdown(
+                        title = "字幕",
+                        options = subtitleOptions,
+                        selectedIndex = selectedSubtitle,
+                        onSelectedIndexChange = { selectedSubtitle = it }
+                    )
+                } else {
+                    Text("仅下载音频并转换为 m4a；不会下载字幕。", style = MaterialTheme.typography.labelSmall)
+                }
                 if (!ffmpegEnabled) {
                     Text(
                         "Full 版可合并分离的视频和音频流。",
@@ -167,8 +186,9 @@ fun YoutubePickerDialog(
                     }
                 }
                 Text(
-                    text = if (result.isPlaylist && !canChooseVideos) "请先选择清晰度和音频，再勾选列表视频。"
+                    text = if (result.isPlaylist && !canChooseVideos) "请先选择视频清晰度或仅音频，再选择音频码率并勾选条目。"
                     else if (result.isPlaylist) "已选择 ${selectedUrls.size}/${state.entries.size}"
+                    else if (selectedAudioOnly) "将只下载音频并转换保存为 .m4a。"
                     else "预估大小仅在 yt-dlp 提供文件大小时显示；实际以下载完成文件为准。",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -183,11 +203,13 @@ fun YoutubePickerDialog(
                             entry = entry,
                             targetHeight = targetHeight ?: 2160,
                             audioCeiling = audioCeiling,
-                            ffmpegEnabled = ffmpegEnabled
+                            ffmpegEnabled = ffmpegEnabled,
+                            audioOnly = selectedAudioOnly
                         )
                         YoutubeEntryRow(
                             entry = entry,
                             estimatedSize = estimated,
+                            audioOnly = selectedAudioOnly,
                             checked = entry.url in selectedUrls,
                             enabled = result.isPlaylist && canChooseVideos,
                             onCheckedChange = { checked ->
@@ -209,7 +231,8 @@ fun YoutubePickerDialog(
                             targetHeight = targetHeight,
                             audioCeiling = audioCeiling,
                             ffmpegEnabled = ffmpegEnabled,
-                            subtitleLanguageOverride = subtitleOptions[selectedSubtitle].value
+                            subtitleLanguageOverride = subtitleOptions[selectedSubtitle].value,
+                            audioOnly = selectedAudioOnly
                         )
                     )
                 }
@@ -256,6 +279,7 @@ private fun <T> ChoiceDropdown(
 private fun YoutubeEntryRow(
     entry: YoutubeMediaEntry,
     estimatedSize: Long?,
+    audioOnly: Boolean,
     checked: Boolean,
     enabled: Boolean,
     onCheckedChange: (Boolean) -> Unit
@@ -280,7 +304,8 @@ private fun YoutubeEntryRow(
             )
             Text(
                 text = buildString {
-                    if (bestHeight > 0) append("最高 ${bestHeight}p")
+                    if (audioOnly) append("仅音频 · m4a")
+                    else if (bestHeight > 0) append("最高 ${bestHeight}p")
                     else append("下载时匹配所选清晰度")
                     append(" · ")
                     append(

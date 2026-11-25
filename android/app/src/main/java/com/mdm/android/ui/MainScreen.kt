@@ -21,16 +21,23 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.background
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Clear
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.ExitToApp
 import androidx.compose.material.icons.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.MoreVert
@@ -39,14 +46,17 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import com.mdm.android.service.DownloadForegroundService
@@ -58,7 +68,7 @@ import uniffi.mdm_android.DownloadState
 import uniffi.mdm_android.DownloadTask
 import java.io.File
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun MainScreen(viewModel: MainViewModel) {
     val tasks by viewModel.tasks.collectAsState()
@@ -69,6 +79,8 @@ fun MainScreen(viewModel: MainViewModel) {
     var showStorageDialog by remember { mutableStateOf(false) }
     var pendingRemoveId by remember { mutableStateOf<String?>(null) }
     var selectedTaskId by remember { mutableStateOf<String?>(null) }
+    var selectedTaskIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var pendingBulkRemoveIds by remember { mutableStateOf<Set<String>?>(null) }
     var fileOpsTaskId by remember { mutableStateOf<String?>(null) }
     var propertiesTaskId by remember { mutableStateOf<String?>(null) }
     var retryOptionsTaskId by remember { mutableStateOf<String?>(null) }
@@ -178,6 +190,12 @@ fun MainScreen(viewModel: MainViewModel) {
             else -> tasks
         }
     }
+    LaunchedEffect(tasks) {
+        val existingIds = tasks.map { it.id }.toSet()
+        selectedTaskIds = selectedTaskIds.intersect(existingIds)
+    }
+    val selectedTasks = remember(tasks, selectedTaskIds) { tasks.filter { it.id in selectedTaskIds } }
+    val allVisibleSelected = filteredTasks.isNotEmpty() && filteredTasks.all { it.id in selectedTaskIds }
     val hasFinished = tasks.any {
         it.state == DownloadState.COMPLETED || it.state == DownloadState.FAILED
     }
@@ -185,20 +203,50 @@ fun MainScreen(viewModel: MainViewModel) {
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("MDM") },
+                title = { Text(if (selectedTaskIds.isEmpty()) "MDM" else "已选 ${selectedTaskIds.size} 项") },
                 actions = {
-                    if (hasFinished) {
-                        IconButton(onClick = { viewModel.clearFinished() }) {
-                            Icon(Icons.Default.Clear, contentDescription = "清除已完成")
+                    if (selectedTaskIds.isNotEmpty()) {
+                        TextButton(onClick = {
+                            selectedTaskIds = if (allVisibleSelected) emptySet() else filteredTasks.map { it.id }.toSet()
+                        }) { Text(if (allVisibleSelected) "取消全选" else "全选") }
+                        if (selectedTasks.any { it.state == DownloadState.DOWNLOADING }) {
+                            IconButton(onClick = {
+                                selectedTasks.filter { it.state == DownloadState.DOWNLOADING }
+                                    .forEach { viewModel.pause(it.id) }
+                            }) { Icon(Icons.Default.Pause, contentDescription = "暂停所选") }
                         }
-                    }
-                    IconButton(onClick = { showSettings = true }) {
-                        Icon(Icons.Default.Settings, contentDescription = "设置")
-                    }
-                    IconButton(onClick = {
-                        if (hasActiveDownload) showExitConfirm = true else doExit()
-                    }) {
-                        Icon(Icons.Default.ExitToApp, contentDescription = "退出")
+                        if (selectedTasks.any {
+                                it.state == DownloadState.PAUSED || it.state == DownloadState.FAILED ||
+                                    it.state == DownloadState.QUEUED
+                            }) {
+                            IconButton(onClick = {
+                                selectedTasks.filter {
+                                    it.state == DownloadState.PAUSED || it.state == DownloadState.FAILED ||
+                                        it.state == DownloadState.QUEUED
+                                }.forEach { viewModel.resume(it.id) }
+                            }) { Icon(Icons.Default.PlayArrow, contentDescription = "继续所选") }
+                        }
+                        IconButton(onClick = {
+                            pendingBulkRemoveIds = selectedTasks.map { it.id }.toSet()
+                            selectedTaskIds = emptySet()
+                        }) { Icon(Icons.Default.Delete, contentDescription = "移除所选") }
+                        IconButton(onClick = { selectedTaskIds = emptySet() }) {
+                            Icon(Icons.Default.Close, contentDescription = "退出多选")
+                        }
+                    } else {
+                        if (hasFinished) {
+                            IconButton(onClick = { viewModel.clearFinished() }) {
+                                Icon(Icons.Default.Clear, contentDescription = "清除已完成")
+                            }
+                        }
+                        IconButton(onClick = { showSettings = true }) {
+                            Icon(Icons.Default.Settings, contentDescription = "设置")
+                        }
+                        IconButton(onClick = {
+                            if (hasActiveDownload) showExitConfirm = true else doExit()
+                        }) {
+                            Icon(Icons.Default.ExitToApp, contentDescription = "退出")
+                        }
                     }
                 }
             )
@@ -211,10 +259,10 @@ fun MainScreen(viewModel: MainViewModel) {
     ) { padding ->
         Column(modifier = Modifier.padding(padding).fillMaxSize()) {
             TabRow(selectedTabIndex = selectedTab) {
-                Tab(selected = selectedTab == 0, onClick = { selectedTab = 0 }, text = { Text("全部") })
-                Tab(selected = selectedTab == 1, onClick = { selectedTab = 1 }, text = { Text("下载中") })
-                Tab(selected = selectedTab == 2, onClick = { selectedTab = 2 }, text = { Text("视频") })
-                Tab(selected = selectedTab == 3, onClick = { selectedTab = 3 }, text = { Text("其他") })
+                Tab(selected = selectedTab == 0, onClick = { selectedTab = 0; selectedTaskIds = emptySet() }, text = { Text("全部") })
+                Tab(selected = selectedTab == 1, onClick = { selectedTab = 1; selectedTaskIds = emptySet() }, text = { Text("下载中") })
+                Tab(selected = selectedTab == 2, onClick = { selectedTab = 2; selectedTaskIds = emptySet() }, text = { Text("视频") })
+                Tab(selected = selectedTab == 3, onClick = { selectedTab = 3; selectedTaskIds = emptySet() }, text = { Text("其他") })
             }
 
             if (filteredTasks.isEmpty()) {
@@ -228,10 +276,20 @@ fun MainScreen(viewModel: MainViewModel) {
                     contentPadding = PaddingValues(start = 8.dp, top = 8.dp, end = 8.dp, bottom = 88.dp),
                     verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    items(filteredTasks, key = { it.id }) { task ->
+                    itemsIndexed(filteredTasks, key = { _, task -> task.id }) { index, task ->
                         DownloadTaskCard(
                             task = task,
-                            onClick = { selectedTaskId = task.id },
+                            position = index + 1,
+                            taskCount = filteredTasks.size,
+                            selected = task.id in selectedTaskIds,
+                            selectionMode = selectedTaskIds.isNotEmpty(),
+                            onClick = {
+                                if (selectedTaskIds.isNotEmpty()) {
+                                    selectedTaskIds = if (task.id in selectedTaskIds) selectedTaskIds - task.id
+                                    else selectedTaskIds + task.id
+                                } else selectedTaskId = task.id
+                            },
+                            onLongClick = { selectedTaskIds = selectedTaskIds + task.id },
                             onPause = { viewModel.pause(task.id) },
                             onResume = { viewModel.resume(task.id) }
                         )
@@ -309,6 +367,7 @@ fun MainScreen(viewModel: MainViewModel) {
     if (showSettings) {
         SettingsDialog(
             youtubeEnabled = YoutubeRuntime.youtubeEnabled,
+            themeStyle = viewModel.themeStyle,
             maxConnections = viewModel.maxConnections,
             speedLimitBps = viewModel.speedLimitBps,
             uploadLimitBps = viewModel.uploadLimitBps,
@@ -324,6 +383,7 @@ fun MainScreen(viewModel: MainViewModel) {
             downloadDir = viewModel.downloadDir,
             downloadLocation = viewModel.downloadLocation,
             hasAllFilesAccess = DownloadForegroundService.hasAllFilesAccess(context),
+            onThemeStyleChange = { viewModel.updateThemeStyle(it) },
             onConnectionsChange = { viewModel.updateMaxConnections(it) },
             onSpeedLimitChange = { viewModel.updateSpeedLimitBps(it) },
             onUploadLimitChange = { viewModel.updateUploadLimitBps(it) },
@@ -394,6 +454,26 @@ fun MainScreen(viewModel: MainViewModel) {
                 TextButton(onClick = {
                     viewModel.remove(pendingRemoveId!!, false)
                     pendingRemoveId = null
+                }) { Text("仅从列表删除") }
+            }
+        )
+    }
+
+    pendingBulkRemoveIds?.let { ids ->
+        AlertDialog(
+            onDismissRequest = { pendingBulkRemoveIds = null },
+            title = { Text("移除 ${ids.size} 个任务") },
+            text = { Text("同时删掉磁盘上的文件吗？选“仅从列表删除”，文件还留在手机里。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    ids.forEach { viewModel.remove(it, true) }
+                    pendingBulkRemoveIds = null
+                }) { Text("从存储删除全部") }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    ids.forEach { viewModel.remove(it, false) }
+                    pendingBulkRemoveIds = null
                 }) { Text("仅从列表删除") }
             }
         )
@@ -583,10 +663,16 @@ fun MainScreen(viewModel: MainViewModel) {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun DownloadTaskCard(
     task: DownloadTask,
+    position: Int,
+    taskCount: Int,
+    selected: Boolean,
+    selectionMode: Boolean,
     onClick: () -> Unit,
+    onLongClick: () -> Unit,
     onPause: () -> Unit,
     onResume: () -> Unit
 ) {
@@ -600,106 +686,153 @@ private fun DownloadTaskCard(
         label = "downloadProgress"
     )
     val animatedBytes = (animatedProgress * task.totalBytes.toFloat()).toLong()
+    var startedAtMillis by rememberSaveable(task.id) {
+        mutableLongStateOf(if (task.state == DownloadState.DOWNLOADING) System.currentTimeMillis() else 0L)
+    }
+    var nowMillis by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(task.id, task.state) {
+        if (task.state == DownloadState.DOWNLOADING && startedAtMillis == 0L) {
+            startedAtMillis = System.currentTimeMillis()
+        }
+        while (task.state == DownloadState.DOWNLOADING) {
+            nowMillis = System.currentTimeMillis()
+            delay(1000)
+        }
+    }
+    val elapsedSeconds = if (startedAtMillis > 0L) ((nowMillis - startedAtMillis) / 1000L).coerceAtLeast(0L) else 0L
+    val totalBytes = task.totalBytes.toLong()
+    val downloadedBytes = task.downloadedBytes.toLong()
+    val remainingSeconds = if (totalBytes > downloadedBytes && task.speedBytesPerSec > 0uL) {
+        (totalBytes - downloadedBytes) / task.speedBytesPerSec.toLong().coerceAtLeast(1L)
+    } else null
+    val minimalist = MaterialTheme.colorScheme.primary == Color(0xFFFED54F)
+    val progressColor = if (minimalist) Color(0xFFFED54F) else MaterialTheme.colorScheme.primary
+    val leadingColor = if (minimalist) Color(0xFF508F89) else MaterialTheme.colorScheme.secondaryContainer
 
-    Card(onClick = onClick, modifier = Modifier.fillMaxWidth()) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(4.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = if (selected) MaterialTheme.colorScheme.secondaryContainer
+            else MaterialTheme.colorScheme.surface
+        )
+    ) {
         Column(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp),
-            verticalArrangement = Arrangement.spacedBy(4.dp)
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-            Icon(
-                Icons.Default.InsertDriveFile,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.primary,
-                modifier = Modifier.size(28.dp)
+            modifier = Modifier.fillMaxWidth().combinedClickable(
+                onClick = onClick,
+                onLongClick = onLongClick
             )
-            Column(
-                modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(3.dp)
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        text = task.title,
-                        style = MaterialTheme.typography.bodyMedium,
-                        fontWeight = FontWeight.Medium,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f)
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(
-                        text = when (task.kind) {
-                            DownloadKind.HTTP -> "HTTP"
-                            DownloadKind.TORRENT_MAGNET -> "Magnet"
-                            DownloadKind.TORRENT_FILE -> "Torrent"
-                            DownloadKind.HLS -> "视频"
-                            DownloadKind.YOUTUBE -> "YouTube"
-                        },
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                }
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = if (task.totalBytes > 0uL) {
-                            "${(animatedProgress * 100).toInt()}% | ${formatSize(animatedBytes)}"
-                        } else if (task.downloadedBytes > 0uL) {
-                            "已下载 ${formatSize(task.downloadedBytes.toLong())}"
-                        } else {
-                            "等待开始…"
-                        },
-                        style = MaterialTheme.typography.labelSmall,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f)
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        text = "${stateLabel(task.state)} · ${formatSpeed(task.speedBytesPerSec.toLong())}",
-                        style = MaterialTheme.typography.labelSmall,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-                if (task.errorMessage != null) {
-                    Text(
-                        text = task.errorMessage!!,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.error,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-            }
-            if (task.state == DownloadState.DOWNLOADING) {
-                IconButton(onClick = onPause, modifier = Modifier.size(30.dp)) {
-                    Icon(Icons.Default.Pause, contentDescription = "暂停")
-                }
-            } else if (task.state == DownloadState.PAUSED || task.state == DownloadState.FAILED) {
-                IconButton(onClick = onResume, modifier = Modifier.size(30.dp)) {
-                    Icon(Icons.Default.PlayArrow, contentDescription = "继续")
-                }
-            }
-            IconButton(onClick = onClick, modifier = Modifier.size(30.dp)) {
-                Icon(Icons.Default.MoreVert, contentDescription = "任务操作")
-            }
-            }
+        ) {
             if (task.totalBytes > 0uL) {
-                Row(modifier = Modifier.fillMaxWidth()) {
-                    Spacer(modifier = Modifier.width(36.dp))
-                    LinearProgressIndicator(
-                        progress = { animatedProgress },
-                        modifier = Modifier.weight(0.7f).height(3.dp)
+                LinearProgressIndicator(
+                    progress = { animatedProgress },
+                    modifier = Modifier.fillMaxWidth().height(3.dp),
+                    color = progressColor,
+                    trackColor = if (minimalist) Color(0xFF212121) else MaterialTheme.colorScheme.surfaceVariant
+                )
+            } else if (task.state == DownloadState.DOWNLOADING || task.state == DownloadState.QUEUED) {
+                LinearProgressIndicator(
+                    modifier = Modifier.fillMaxWidth().height(3.dp),
+                    color = progressColor,
+                    trackColor = if (minimalist) Color(0xFF212121) else MaterialTheme.colorScheme.surfaceVariant
+                )
+            } else {
+                LinearProgressIndicator(
+                    progress = { if (task.state == DownloadState.COMPLETED) 1f else 0f },
+                    modifier = Modifier.fillMaxWidth().height(3.dp),
+                    color = progressColor,
+                    trackColor = if (minimalist) Color(0xFF212121) else MaterialTheme.colorScheme.surfaceVariant
+                )
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth().height(64.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(7.dp)
+            ) {
+                Box(
+                    modifier = Modifier.width(38.dp).fillMaxHeight().background(leadingColor),
+                    contentAlignment = Alignment.Center
+                ) {
+                    if (selectionMode) {
+                        Checkbox(checked = selected, onCheckedChange = { onClick() })
+                    } else {
+                        Icon(
+                            Icons.Default.InsertDriveFile,
+                            contentDescription = null,
+                            tint = if (minimalist) Color(0xFFEAF4F2) else MaterialTheme.colorScheme.onSecondaryContainer,
+                            modifier = Modifier.size(24.dp)
+                        )
+                    }
+                }
+                Column(
+                    modifier = Modifier.weight(1f).padding(vertical = 7.dp),
+                    verticalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            text = task.title,
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Medium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Spacer(modifier = Modifier.width(5.dp))
+                        Text(
+                            text = when (task.kind) {
+                                DownloadKind.HTTP -> "HTTP"
+                                DownloadKind.TORRENT_MAGNET -> "Magnet"
+                                DownloadKind.TORRENT_FILE -> "视频"
+                                DownloadKind.HLS -> "视频"
+                                DownloadKind.YOUTUBE -> "YouTube"
+                            },
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (minimalist) Color(0xFF86C9C0) else MaterialTheme.colorScheme.primary,
+                            maxLines = 1
+                        )
+                    }
+                    val metadata = buildList {
+                        if (task.totalBytes > 0uL) add("${(animatedProgress * 100).toInt()}% · ${formatSize(animatedBytes)}")
+                        else if (downloadedBytes > 0L) add(formatSize(downloadedBytes))
+                        else add(stateLabel(task.state))
+                        if (taskCount > 1) add("$position/$taskCount")
+                        if (task.speedBytesPerSec > 0uL) add(formatSpeed(task.speedBytesPerSec.toLong()))
+                        if (elapsedSeconds > 0L) {
+                            add(if (remainingSeconds != null) {
+                                "${formatDuration(elapsedSeconds)}/${formatDuration(remainingSeconds)}"
+                            } else formatDuration(elapsedSeconds))
+                        }
+                    }.joinToString(" · ")
+                    Text(
+                        text = metadata,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
-                    Spacer(modifier = Modifier.weight(0.3f))
+                    if (task.errorMessage != null) {
+                        Text(
+                            text = task.errorMessage!!,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.error,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+                if (!selectionMode && task.state == DownloadState.DOWNLOADING) {
+                    IconButton(onClick = onPause, modifier = Modifier.size(30.dp)) {
+                        Icon(Icons.Default.Pause, contentDescription = "暂停")
+                    }
+                } else if (!selectionMode && (task.state == DownloadState.PAUSED || task.state == DownloadState.FAILED)) {
+                    IconButton(onClick = onResume, modifier = Modifier.size(30.dp)) {
+                        Icon(Icons.Default.PlayArrow, contentDescription = "继续")
+                    }
+                }
+                if (!selectionMode) {
+                    IconButton(onClick = onClick, modifier = Modifier.size(30.dp)) {
+                        Icon(Icons.Default.MoreVert, contentDescription = "任务操作")
+                    }
                 }
             }
         }
@@ -961,17 +1094,19 @@ private fun AddLinkDialog(
                     Text(
                         if (selectedHeight != null && selectedAudio != null && !isYouTubePlaylistLink(text))
                             "已选清晰度与音频：点“开始下载”后直接启动；所选档位不可用时自动降到下一档。"
+                        else if (selectedHeight == null && selectedAudio != null && !isYouTubePlaylistLink(text))
+                            "未选视频清晰度：只下载音频，并转换保存为 .m4a。"
                         else if (isYouTubePlaylistLink(text))
-                            "播放列表仍会先读取条目，供你多选或全选后开始下载。"
+                            "播放列表会先读取条目；未选视频清晰度时可只下载音频（.m4a），再多选条目。"
                         else
-                            "清晰度和音频都选好后可直接启动；未选齐时先解析，再确认视频与字幕。",
+                            "选好音频码率和视频清晰度可直接下载；只选音频不选清晰度时会保存为 .m4a。",
                         style = MaterialTheme.typography.bodySmall
                     )
                 }
                 Spacer(modifier = Modifier.height(4.dp))
                 if (youtubeEnabled) {
                     Text(
-                        "未选齐清晰度和音频时，YouTube 会先解析视频信息；播放列表需选择下载条目。同名文件不会覆盖已有文件。",
+                        "只选音频、不选视频清晰度时仅下载音频并转成 .m4a；未完成其他选项时会先解析。同名文件不会覆盖已有文件。",
                         style = MaterialTheme.typography.bodySmall
                     )
                 } else {
@@ -1008,10 +1143,25 @@ private fun formatSize(bytes: Long): String = when {
     else -> "$bytes B"
 }
 
+private fun formatDuration(seconds: Long): String {
+    val safeSeconds = seconds.coerceAtLeast(0L)
+    val hours = safeSeconds / 3600
+    val minutes = (safeSeconds % 3600) / 60
+    val remainder = safeSeconds % 60
+    return if (hours > 0) {
+        String.format("%d:%02d:%02d", hours, minutes, remainder)
+    } else if (minutes > 0) {
+        String.format("%dm%02ds", minutes, remainder)
+    } else {
+        "${remainder}s"
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun SettingsDialog(
     youtubeEnabled: Boolean,
+    themeStyle: String,
     maxConnections: Int,
     speedLimitBps: Long,
     uploadLimitBps: Long,
@@ -1027,6 +1177,7 @@ private fun SettingsDialog(
     downloadDir: String,
     downloadLocation: String,
     hasAllFilesAccess: Boolean,
+    onThemeStyleChange: (String) -> Unit,
     onConnectionsChange: (Int) -> Unit,
     onSpeedLimitChange: (Long) -> Unit,
     onUploadLimitChange: (Long) -> Unit,
@@ -1109,6 +1260,28 @@ private fun SettingsDialog(
                 modifier = Modifier.heightIn(max = 560.dp).verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
+                Column {
+                    Text("外观主题", style = MaterialTheme.typography.titleSmall)
+                    Row(
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        FilterChip(
+                            selected = themeStyle == "default",
+                            onClick = { onThemeStyleChange("default") },
+                            label = { Text("标准") }
+                        )
+                        FilterChip(
+                            selected = themeStyle == "minimalist",
+                            onClick = { onThemeStyleChange("minimalist") },
+                            label = { Text("Minimalist") }
+                        )
+                    }
+                    Text(
+                        "Minimalist 使用深灰纯色界面、青绿色图标区和暖黄进度线。",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
                 Column {
                     Text("下载目录", style = MaterialTheme.typography.titleSmall)
                     Spacer(modifier = Modifier.height(4.dp))

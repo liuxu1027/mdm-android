@@ -120,13 +120,15 @@ class DownloadForegroundService : Service(), ProgressListener {
                 val names = intent.getStringArrayListExtra(EXTRA_YOUTUBE_NAMES).orEmpty()
                 val formats = intent.getStringArrayListExtra(EXTRA_YOUTUBE_FORMATS).orEmpty()
                 val subtitles = intent.getStringArrayListExtra(EXTRA_YOUTUBE_SUBTITLES).orEmpty()
+                val audioOnly = intent.getStringArrayListExtra(EXTRA_YOUTUBE_AUDIO_ONLY).orEmpty()
                 if (YoutubeRuntime.youtubeEnabled) {
                     urls.forEachIndexed { index, url ->
                         youtubeManager?.add(
                             url,
                             names.getOrNull(index),
                             formats.getOrNull(index),
-                            subtitles.getOrNull(index)?.takeIf { it.isNotBlank() }
+                            subtitles.getOrNull(index)?.takeIf { it.isNotBlank() },
+                            audioOnly.getOrNull(index) == "true"
                         )?.let(::noteTaskCreated)
                     }
                 }
@@ -357,6 +359,7 @@ class DownloadForegroundService : Service(), ProgressListener {
         const val EXTRA_YOUTUBE_NAMES = "extra_youtube_names"
         const val EXTRA_YOUTUBE_FORMATS = "extra_youtube_formats"
         const val EXTRA_YOUTUBE_SUBTITLES = "extra_youtube_subtitles"
+        const val EXTRA_YOUTUBE_AUDIO_ONLY = "extra_youtube_audio_only"
         const val EXTRA_YTDLP_STATUS = "extra_ytdlp_status"
 
         /** 是否有“所有文件访问权限”（Android 11+）。 */

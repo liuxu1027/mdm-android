@@ -8,7 +8,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
-import androidx.compose.material3.MaterialTheme
+import com.mdm.android.ui.MdmTheme
 import com.mdm.android.ui.MainScreen
 import com.mdm.android.ui.MainViewModel
 
@@ -27,7 +27,7 @@ class MainActivity : ComponentActivity() {
         handleIncomingIntent(intent)
 
         setContent {
-            MaterialTheme {
+            MdmTheme(themeStyle = viewModel.themeStyle) {
                 MainScreen(viewModel = viewModel)
             }
         }
