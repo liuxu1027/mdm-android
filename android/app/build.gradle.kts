@@ -38,7 +38,6 @@ android {
     productFlavors {
         create("lite") {
             dimension = "edition"
-            versionNameSuffix = "-lite"
         }
         create("full") {
             dimension = "edition"

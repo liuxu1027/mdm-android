@@ -126,15 +126,32 @@ pub(crate) fn webpki_config(extra: &[Vec<u8>]) -> rustls::ClientConfig {
 else:
     print(f"Warning: {TLS_RS} not found.")
 
-# --- ftp.rs: client_config uses webpki_config on Android ---------------------------------
-# The old approach (Verifier::new on Android) still needs the platform verifier's JNI init
-# and Kotlin class at handshake time, so it fails the same way. Bypass it entirely.
-# The Verifier name only exists on non-Android, so its uses must be #[cfg]-gated:
-# an early return alone does not help, unreachable code is still compiled.
+# --- ftp.rs: avoid JNI-backed rustls-platform-verifier on Android ------------------------
+# Older upstream versions did this in client_config; newer versions split verifier by cfg.
 if FTP_RS.exists():
     text = FTP_RS.read_text(encoding="utf-8")
     patched = False
 
+    # Current upstream uses the platform verifier for FTP when there are no extra roots.
+    # That path requires Android JNI initialization and a Kotlin helper the app does not ship.
+    android_fallback = """    if extra.is_empty() {
+        return Ok(Arc::new(rustls_platform_verifier::Verifier::new(provider)?));
+    }
+"""
+    old_android_comment = """/// Android's platform verifier asks the system's trust store through Java and takes no extra
+/// roots: with `extra` (only the tests give any), Mozilla's roots and them are checked by
+/// rustls' own verifier instead."""
+    new_android_comment = """/// Android verifies against bundled Mozilla roots and `extra` using rustls' pure-Rust WebPKI
+/// verifier, avoiding Java platform-verifier initialization."""
+    if android_fallback in text:
+        text = text.replace(android_fallback, "", 1)
+        if old_android_comment in text:
+            text = text.replace(old_android_comment, new_android_comment, 1)
+        patched = True
+    elif new_android_comment in text:
+        print(f"Already patched (Android verifier): {FTP_RS}")
+
+    current_split_verifier = '#[cfg(target_os = "android")]\nfn verifier(' in text
     old_sig = """pub(crate) fn client_config(extra: &[Vec<u8>]) -> Result<rustls::ClientConfig, rustls::Error> {
     use rustls_platform_verifier::Verifier;"""
     new_sig = """pub(crate) fn client_config(extra: &[Vec<u8>]) -> Result<rustls::ClientConfig, rustls::Error> {
@@ -150,6 +167,8 @@ if FTP_RS.exists():
     elif old_sig in text:
         text = text.replace(old_sig, new_sig, 1)
         patched = True
+    elif current_split_verifier:
+        print(f"Current upstream uses target-specific FTP verifier: {FTP_RS}")
     else:
         print(f"Warning: Could not find client_config signature in {FTP_RS}")
 
@@ -185,18 +204,21 @@ if FTP_RS.exists():
     elif old_tail in text:
         text = text.replace(old_tail, new_tail, 1)
         patched = True
+    elif current_split_verifier:
+        print(f"Current upstream uses target-specific FTP verifier: {FTP_RS}")
     else:
         print(f"Warning: Could not find client_config tail in {FTP_RS}")
 
-    # CertificateDer is only used by the cfg-gated `let extra` line above; gate the
-    # import too so Android builds have no unused-import warning.
+    # Current upstream also uses CertificateDer in its Android-gated verifier,
+    # so keep the import available on Android. Restore it if an earlier version
+    # of this patch script gated the import incorrectly.
     old_import = "use rustls::pki_types::CertificateDer;"
     new_import = '#[cfg(not(target_os = "android"))]\nuse rustls::pki_types::CertificateDer;'
     if new_import in text:
-        print(f"Already patched (import): {FTP_RS}")
-    elif old_import in text:
-        text = text.replace(old_import, new_import, 1)
+        text = text.replace(new_import, old_import, 1)
         patched = True
+    elif old_import in text:
+        print(f"CertificateDer import is available on all targets: {FTP_RS}")
     else:
         print(f"Warning: Could not find CertificateDer import in {FTP_RS}")
 
