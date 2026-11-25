@@ -40,16 +40,26 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.ExitToApp
 import androidx.compose.material.icons.filled.InsertDriveFile
+import androidx.compose.material.icons.filled.Android
+import androidx.compose.material.icons.filled.FolderZip
+import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.Movie
+import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.PictureAsPdf
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -60,6 +70,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import com.mdm.android.service.DownloadForegroundService
+import com.mdm.android.service.DownloadTaskTiming
 import com.mdm.android.service.YoutubeRuntime
 import com.mdm.android.service.YoutubeMediaResolver
 import com.mdm.android.service.YoutubeCookieStore
@@ -686,20 +697,37 @@ private fun DownloadTaskCard(
         label = "downloadProgress"
     )
     val animatedBytes = (animatedProgress * task.totalBytes.toFloat()).toLong()
+    val context = LocalContext.current
     var startedAtMillis by rememberSaveable(task.id) {
-        mutableLongStateOf(if (task.state == DownloadState.DOWNLOADING) System.currentTimeMillis() else 0L)
+        mutableLongStateOf(DownloadTaskTiming.startedAt(context, task.id))
     }
-    var nowMillis by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    var nowMillis by remember(task.id) { mutableLongStateOf(System.currentTimeMillis()) }
     LaunchedEffect(task.id, task.state) {
-        if (task.state == DownloadState.DOWNLOADING && startedAtMillis == 0L) {
-            startedAtMillis = System.currentTimeMillis()
+        if (startedAtMillis == 0L) {
+            val savedStart = DownloadTaskTiming.startedAt(context, task.id)
+            if (savedStart > 0L) startedAtMillis = savedStart
         }
-        while (task.state == DownloadState.DOWNLOADING) {
-            nowMillis = System.currentTimeMillis()
-            delay(1000)
+        if (task.state == DownloadState.DOWNLOADING && startedAtMillis == 0L) {
+            startedAtMillis = DownloadTaskTiming.ensureStartedAt(context, task.id)
+        }
+        if (task.state == DownloadState.DOWNLOADING) {
+            while (task.state == DownloadState.DOWNLOADING) {
+                nowMillis = System.currentTimeMillis()
+                delay(1000)
+            }
+        } else {
+            nowMillis = DownloadTaskTiming.stoppedAt(context, task.id)
+                .takeIf { it > 0L } ?: System.currentTimeMillis()
         }
     }
-    val elapsedSeconds = if (startedAtMillis > 0L) ((nowMillis - startedAtMillis) / 1000L).coerceAtLeast(0L) else 0L
+    val stoppedAtMillis = remember(task.id, task.state, task.downloadedBytes) {
+        DownloadTaskTiming.stoppedAt(context, task.id)
+    }
+    val elapsedEndMillis = if (task.state == DownloadState.DOWNLOADING) nowMillis
+    else stoppedAtMillis.takeIf { it > 0L } ?: nowMillis
+    val elapsedSeconds = if (startedAtMillis > 0L) {
+        ((elapsedEndMillis - startedAtMillis) / 1000L).coerceAtLeast(0L)
+    } else 0L
     val totalBytes = task.totalBytes.toLong()
     val downloadedBytes = task.downloadedBytes.toLong()
     val remainingSeconds = if (totalBytes > downloadedBytes && task.speedBytesPerSec > 0uL) {
@@ -708,14 +736,29 @@ private fun DownloadTaskCard(
     val minimalist = MaterialTheme.colorScheme.primary == Color(0xFFFED54F)
     val progressColor = if (minimalist) Color(0xFFFED54F) else MaterialTheme.colorScheme.primary
     val leadingColor = if (minimalist) Color(0xFF508F89) else MaterialTheme.colorScheme.secondaryContainer
+    val rowProgress = if (task.state == DownloadState.COMPLETED) 1f else animatedProgress
+    val rowBaseColor = if (selected) MaterialTheme.colorScheme.secondaryContainer
+    else MaterialTheme.colorScheme.surface
+    val defaultLeadingColor = MaterialTheme.colorScheme.secondaryContainer
+    val rowModifier = Modifier.fillMaxWidth().height(64.dp).then(
+        if (minimalist) Modifier else Modifier.drawBehind {
+            drawRect(color = rowBaseColor)
+            val iconWidth = 38.dp.toPx().coerceAtMost(size.width)
+            drawRect(color = defaultLeadingColor, size = Size(iconWidth, size.height))
+            if (rowProgress > 0f) {
+                drawRect(
+                    color = Color(0xFF508F89),
+                    size = Size(size.width * rowProgress, size.height)
+                )
+            }
+        }
+    )
+    val (taskIcon, taskIconDescription) = taskFileIcon(task)
 
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(4.dp),
-        colors = CardDefaults.cardColors(
-            containerColor = if (selected) MaterialTheme.colorScheme.secondaryContainer
-            else MaterialTheme.colorScheme.surface
-        )
+        colors = CardDefaults.cardColors(containerColor = rowBaseColor)
     ) {
         Column(
             modifier = Modifier.fillMaxWidth().combinedClickable(
@@ -744,21 +787,24 @@ private fun DownloadTaskCard(
                     trackColor = if (minimalist) Color(0xFF212121) else MaterialTheme.colorScheme.surfaceVariant
                 )
             }
-            Row(
-                modifier = Modifier.fillMaxWidth().height(64.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(7.dp)
-            ) {
+            Box(modifier = rowModifier) {
+                Row(
+                    modifier = Modifier.fillMaxSize(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(7.dp)
+                ) {
                 Box(
-                    modifier = Modifier.width(38.dp).fillMaxHeight().background(leadingColor),
+                    modifier = Modifier.width(38.dp).fillMaxHeight().then(
+                        if (minimalist) Modifier.background(leadingColor) else Modifier
+                    ),
                     contentAlignment = Alignment.Center
                 ) {
                     if (selectionMode) {
                         Checkbox(checked = selected, onCheckedChange = { onClick() })
                     } else {
                         Icon(
-                            Icons.Default.InsertDriveFile,
-                            contentDescription = null,
+                            imageVector = taskIcon,
+                            contentDescription = taskIconDescription,
                             tint = if (minimalist) Color(0xFFEAF4F2) else MaterialTheme.colorScheme.onSecondaryContainer,
                             modifier = Modifier.size(24.dp)
                         )
@@ -795,9 +841,14 @@ private fun DownloadTaskCard(
                         if (task.totalBytes > 0uL) add("${(animatedProgress * 100).toInt()}% · ${formatSize(animatedBytes)}")
                         else if (downloadedBytes > 0L) add(formatSize(downloadedBytes))
                         else add(stateLabel(task.state))
+                        if (!minimalist && elapsedSeconds > 0L) {
+                            add(if (remainingSeconds != null) {
+                                "${formatDuration(elapsedSeconds)}/${formatDuration(remainingSeconds)}"
+                            } else formatDuration(elapsedSeconds))
+                        }
                         if (taskCount > 1) add("$position/$taskCount")
                         if (task.speedBytesPerSec > 0uL) add(formatSpeed(task.speedBytesPerSec.toLong()))
-                        if (elapsedSeconds > 0L) {
+                        if (minimalist && elapsedSeconds > 0L) {
                             add(if (remainingSeconds != null) {
                                 "${formatDuration(elapsedSeconds)}/${formatDuration(remainingSeconds)}"
                             } else formatDuration(elapsedSeconds))
@@ -835,7 +886,45 @@ private fun DownloadTaskCard(
                     }
                 }
             }
+            }
         }
+    }
+}
+
+private data class TaskFileIcon(val imageVector: ImageVector, val description: String)
+
+private val VIDEO_EXTENSIONS = setOf(
+    "mp4", "mkv", "mov", "avi", "wmv", "flv", "webm", "m4v", "ts", "mpeg", "mpg", "3gp", "ogv"
+)
+private val ARCHIVE_EXTENSIONS = setOf(
+    "zip", "rar", "7z", "tar", "gz", "bz2", "xz", "zst", "tgz", "tbz", "tbz2", "txz"
+)
+private val AUDIO_EXTENSIONS = setOf(
+    "mp3", "m4a", "aac", "flac", "wav", "ogg", "opus", "wma", "m4b", "aiff", "alac"
+)
+private val IMAGE_EXTENSIONS = setOf(
+    "jpg", "jpeg", "png", "gif", "bmp", "webp", "heic", "heif", "avif", "svg"
+)
+
+private fun taskFileIcon(task: DownloadTask): TaskFileIcon {
+    val titleName = task.title.substringAfterLast('/').substringAfterLast('\\')
+    val sourceName = task.sourceUrl.substringBefore('?').substringBefore('#')
+        .substringAfterLast('/').substringAfterLast('\\')
+    val extension = titleName.substringAfterLast('.', "").lowercase()
+        .ifBlank { sourceName.substringAfterLast('.', "").lowercase() }
+    return when {
+        task.kind == DownloadKind.TORRENT_MAGNET -> TaskFileIcon(Icons.Default.Share, "种子 / P2P 下载")
+        extension == "torrent" -> TaskFileIcon(Icons.Default.Share, "Torrent 种子文件")
+        extension in VIDEO_EXTENSIONS -> TaskFileIcon(Icons.Default.Movie, "视频文件")
+        extension in ARCHIVE_EXTENSIONS -> TaskFileIcon(Icons.Default.FolderZip, "压缩包")
+        extension in AUDIO_EXTENSIONS -> TaskFileIcon(Icons.Default.MusicNote, "音频文件")
+        extension in IMAGE_EXTENSIONS -> TaskFileIcon(Icons.Default.Image, "图片文件")
+        extension in setOf("apk", "aab", "apks", "xapk") -> TaskFileIcon(Icons.Default.Android, "Android 安装包")
+        extension == "pdf" -> TaskFileIcon(Icons.Default.PictureAsPdf, "PDF 文件")
+        task.kind == DownloadKind.TORRENT_FILE -> TaskFileIcon(Icons.Default.Share, "Torrent 下载")
+        task.kind == DownloadKind.HLS || task.kind == DownloadKind.YOUTUBE ->
+            TaskFileIcon(Icons.Default.Movie, "视频文件")
+        else -> TaskFileIcon(Icons.Default.InsertDriveFile, "文件")
     }
 }
 

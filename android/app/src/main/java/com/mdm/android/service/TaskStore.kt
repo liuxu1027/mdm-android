@@ -19,6 +19,8 @@ import java.util.concurrent.Executors
 class TaskStore(context: Context) :
     SQLiteOpenHelper(context, DB_NAME, null, DB_VERSION) {
 
+    private val appContext = context.applicationContext
+
     // 所有写操作串在一根单线程上，避免并发写乱序。
     private val writer = Executors.newSingleThreadExecutor()
     private val writeLock = Any()
@@ -105,6 +107,7 @@ class TaskStore(context: Context) :
      * 只有进度数字变化时节流到 2 秒写一次（异步）。
      */
     fun saveThrottled(tasks: List<DownloadTask>) {
+        DownloadTaskTiming.recordTaskStates(appContext, tasks)
         val sig = tasks.sortedBy { it.id }
             .joinToString("|") { "${it.id}:${it.state.name}:${it.title}:${it.savePath}" }
         val now = SystemClock.elapsedRealtime()
@@ -121,6 +124,7 @@ class TaskStore(context: Context) :
 
     /** 退出/销毁前立刻落盘（同步写，保证数据进了库才走）。 */
     fun saveNow(tasks: List<DownloadTask>) {
+        DownloadTaskTiming.recordTaskStates(appContext, tasks)
         lastSavedAtMs = SystemClock.elapsedRealtime()
         lastSignature = tasks.sortedBy { it.id }
             .joinToString("|") { "${it.id}:${it.state.name}:${it.title}:${it.savePath}" }
