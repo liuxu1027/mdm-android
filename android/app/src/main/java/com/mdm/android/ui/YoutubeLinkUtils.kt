@@ -18,3 +18,14 @@ fun isYouTubePlaylistLink(input: String): Boolean {
     return uri.path.orEmpty().contains("/playlist", ignoreCase = true) ||
         !uri.getQueryParameter("list").isNullOrBlank()
 }
+
+/** ppnix 剧集页（如 /cn/tv/1304.html）：页面里带剧集编号，可直接拼出各集地址。 */
+fun isPpnixSeriesPage(input: String): Boolean {
+    val value = input.trim()
+    if (value.isEmpty()) return false
+    val withScheme = if (value.contains("://")) value else "https://$value"
+    val uri = runCatching { Uri.parse(withScheme) }.getOrNull() ?: return false
+    val host = uri.host?.lowercase() ?: return false
+    if (host != "ppnix.com" && !host.endsWith(".ppnix.com")) return false
+    return uri.path.orEmpty().contains("/tv/", ignoreCase = true)
+}
