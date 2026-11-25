@@ -8,7 +8,6 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import uniffi.mdm_android.DownloadKind
 import uniffi.mdm_android.DownloadState
 import uniffi.mdm_android.DownloadTask
@@ -17,7 +16,6 @@ import com.yausername.youtubedl_android.YoutubeDLRequest
 import java.io.File
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
-import kotlin.math.max
 
 /** MDM task-list adapter for yt-dlp's Android runtime. */
 class YoutubeDownloadManager(
@@ -60,14 +58,19 @@ class YoutubeDownloadManager(
         subtitleLanguage: String? = null
     ) {
         val id = UUID.randomUUID().toString()
+        val cleanRequestedName = requestedName?.takeIf { it.isNotBlank() }?.let(::sanitizeBaseName)
+        val prefix = cleanRequestedName?.let { uniqueBaseName(downloadDir, it, id) }
+            ?: "mdm-${id.replace("-", "").take(12)}-"
         optionsPrefs.edit()
             .putString("$id.format", formatSelector?.takeIf { it.isNotBlank() } ?: DEFAULT_FORMAT)
             .putString("$id.subtitle", subtitleLanguage?.takeIf { it.isNotBlank() })
+            .putString("$id.name", cleanRequestedName)
+            .putString("$id.prefix", prefix)
             .apply()
-        val pendingPath = File(downloadDir, ".yt-dlp-$id.pending").absolutePath
+        val pendingPath = File(downloadDir, "$prefix.pending").absolutePath
         val task = DownloadTask(
             id = id,
-            title = requestedName?.takeIf { it.isNotBlank() }?.let(::sanitizeBaseName) ?: "正在解析 YouTube…",
+            title = cleanRequestedName ?: "YouTube 下载 · ${id.take(6)}",
             sourceUrl = url,
             savePath = pendingPath,
             kind = DownloadKind.YOUTUBE,
@@ -84,6 +87,42 @@ class YoutubeDownloadManager(
         startQueuedTasks()
     }
 
+    fun redownload(id: String) {
+        val old = get(id) ?: return
+        val name = optionsPrefs.getString("$id.name", null)
+            ?: File(old.savePath).takeIf { !old.savePath.endsWith(".pending") }?.nameWithoutExtension
+        val format = optionsPrefs.getString("$id.format", DEFAULT_FORMAT)
+        val subtitle = optionsPrefs.getString("$id.subtitle", null)
+        add(old.sourceUrl, name, format, subtitle)
+    }
+
+    fun rename(id: String, requestedName: String): Result<Unit> = runCatching {
+        val task = get(id) ?: error("找不到下载任务")
+        require(task.state == DownloadState.COMPLETED) { "只能重命名已完成的文件" }
+        val source = File(task.savePath)
+        require(source.isFile) { "找不到下载文件，无法重命名" }
+        val base = sanitizeBaseName(requestedName)
+        val extension = source.extension.takeIf { it.isNotBlank() }
+        val destination = File(source.parentFile ?: downloadDir, buildString {
+            append(base)
+            if (extension != null) append(".$extension")
+        })
+        require(source.absolutePath == destination.absolutePath || !destination.exists()) { "同名文件已存在，请换一个名称" }
+        if (source.absolutePath != destination.absolutePath) {
+            check(source.renameTo(destination)) { "重命名失败" }
+        }
+        val prefix = destination.nameWithoutExtension
+        optionsPrefs.edit().putString("$id.name", prefix).putString("$id.prefix", prefix).apply()
+        update(id) {
+            it.copy(title = destination.name, savePath = destination.absolutePath)
+        }
+    }
+
+    fun updateLocation(id: String, path: String, title: String) {
+        optionsPrefs.edit().putString("$id.name", sanitizeBaseName(title)).apply()
+        update(id) { it.copy(title = title, savePath = path) }
+    }
+
     fun pause(id: String) {
         if (!contains(id)) return
         pauseRequested.add(id)
@@ -91,9 +130,7 @@ class YoutubeDownloadManager(
             runCatching { YoutubeDL.getInstance().destroyProcessById(processId) }
         }
         val current = get(id)
-        val bytes = current?.takeIf { !it.savePath.endsWith(".pending") }?.let {
-            observedBytes(File(it.savePath).parentFile ?: downloadDir, File(it.savePath).nameWithoutExtension)
-        } ?: 0L
+        val bytes = current?.let { observedBytes(downloadDir, it.id, outputPrefix(it.id, it.savePath)) } ?: 0L
         update(id) {
             it.copy(
                 state = DownloadState.PAUSED,
@@ -129,16 +166,18 @@ class YoutubeDownloadManager(
         val removed = synchronized(lock) { tasks.remove(id) }
         publish()
         if (deleteFiles && removed != null) {
-            val savedFile = File(removed.savePath)
-            val generatedFiles = if (removed.savePath.endsWith(".pending")) {
-                listOf(savedFile)
-            } else {
-                val basePrefix = "${savedFile.nameWithoutExtension}."
-                savedFile.parentFile?.listFiles()?.filter { it.name.startsWith(basePrefix) }.orEmpty()
-            }
-            generatedFiles.forEach { runCatching { it.delete() } }
+            val prefix = optionsPrefs.getString("$id.prefix", null)
+                ?: File(removed.savePath).nameWithoutExtension
+            downloadDir.listFiles()
+                ?.filter { taskFileMatches(id, it.name, prefix) }
+                ?.forEach { runCatching { it.delete() } }
         }
-        optionsPrefs.edit().remove("$id.format").remove("$id.subtitle").apply()
+        optionsPrefs.edit()
+            .remove("$id.format")
+            .remove("$id.subtitle")
+            .remove("$id.name")
+            .remove("$id.prefix")
+            .apply()
     }
 
     fun hasActiveDownloads(): Boolean = synchronized(lock) {
@@ -154,10 +193,8 @@ class YoutubeDownloadManager(
             }
         }
         active.forEach { task ->
-            val file = File(task.savePath)
-            val bytes = if (task.savePath.endsWith(".pending")) 0L else {
-                observedBytes(file.parentFile ?: downloadDir, file.nameWithoutExtension)
-            }
+            val prefix = outputPrefix(task.id, task.savePath)
+            val bytes = observedBytes(downloadDir, task.id, prefix)
             update(task.id) {
                 it.copy(
                     state = DownloadState.PAUSED,
@@ -169,7 +206,7 @@ class YoutubeDownloadManager(
         scope.cancel()
     }
 
-    private fun start(id: String, requestedName: String?) {
+    private fun start(id: String) {
         if (!contains(id)) return
         val oldJob = jobs[id]
         if (oldJob?.isActive == true) return
@@ -178,95 +215,74 @@ class YoutubeDownloadManager(
             try {
                 YoutubeDL.getInstance().init(appContext)
                 YoutubeRuntime.init(appContext)
-                val source = get(id)?.sourceUrl ?: return@launch
+                val current = get(id) ?: return@launch
+                val source = current.sourceUrl
                 val formatSelector = optionsPrefs.getString("$id.format", null) ?: DEFAULT_FORMAT
                 val subtitleLanguage = optionsPrefs.getString("$id.subtitle", null)
-                val infoRequest = YoutubeDLRequest(source).apply {
-                    addOption("--no-playlist")
-                    addOption("-f", formatSelector)
-                }
-                val info = withContext(Dispatchers.IO) {
-                    YoutubeDL.getInstance().getInfo(infoRequest)
-                }
+                val requestedName = optionsPrefs.getString("$id.name", null)?.takeIf { it.isNotBlank() }
+                val prefix = optionsPrefs.getString("$id.prefix", null)
+                    ?: File(current.savePath).nameWithoutExtension
+                val outputBase = File(current.savePath).parentFile ?: downloadDir
+                outputBase.mkdirs()
                 if (!contains(id) || id in removedIds) return@launch
                 if (id in pauseRequested) {
                     update(id) { it.copy(state = DownloadState.PAUSED, speedBytesPerSec = 0u) }
                     return@launch
                 }
 
-                val ext = info.ext?.takeIf { it.matches(Regex("[A-Za-z0-9]{1,8}")) }
-                    ?.lowercase() ?: "mp4"
-                val current = get(id) ?: return@launch
-                val isResuming = !current.savePath.endsWith(".pending")
-                val base = if (isResuming) {
-                    File(current.savePath).nameWithoutExtension
-                } else {
-                    requestedName?.takeIf { it.isNotBlank() }
-                        ?: info.title?.takeIf { it.isNotBlank() }
-                        ?: "youtube_video"
-                }.let(::sanitizeBaseName)
-                val outputBase = if (isResuming) {
-                    File(current.savePath).parentFile ?: downloadDir
-                } else {
-                    downloadDir
-                }
-                val resolvedBase = if (isResuming) base else uniqueBaseName(outputBase, base, id)
-                val savePath = File(outputBase, "$resolvedBase.$ext")
-                val title = savePath.name
-                val totalSize = max(info.fileSize, info.fileSizeApproximate).coerceAtLeast(0L).toULong()
+                val initialBytes = observedBytes(outputBase, id, prefix)
                 update(id) {
                     it.copy(
-                        title = title,
-                        savePath = savePath.absolutePath,
-                        totalBytes = totalSize,
+                        title = requestedName ?: it.title,
+                        totalBytes = 0u,
+                        downloadedBytes = initialBytes.toULong(),
                         errorMessage = null,
                         state = DownloadState.DOWNLOADING
                     )
                 }
 
+                val outputTemplate = if (requestedName != null) {
+                    File(outputBase, "${prefix.replace("%", "%%")}.%(ext)s").absolutePath
+                } else {
+                    File(outputBase, "${prefix.replace("%", "%%")}%(title).160B.%(ext)s").absolutePath
+                }
                 val request = YoutubeDLRequest(source).apply {
                     addOption("--no-playlist")
                     addOption("--no-warnings")
                     addOption("--continue")
+                    addOption("--newline")
                     addOption("-f", formatSelector)
-                    if (!subtitleLanguage.isNullOrBlank()) {
-                        addOption("--write-subs")
-                        addOption("--sub-langs", subtitleLanguage)
-                        addOption("--sub-format", "vtt/best")
-                    }
-                    addOption("-o", File(outputBase, "${resolvedBase.replace("%", "%%")}.%(ext)s").absolutePath)
+                    addOption("-o", outputTemplate)
                 }
                 val processId = "mdm-ytdlp-${id}-${System.nanoTime()}"
                 processIds[id] = processId
-                var lastBytes = 0L
+                var lastBytes = initialBytes
                 var lastAt = System.nanoTime()
-                YoutubeDL.getInstance().execute(request, processId) { progress, _, _ ->
+                YoutubeDL.getInstance().execute(request, processId) { _, _, _ ->
                     if (contains(id) && id !in removedIds && id !in pauseRequested) {
-                        val partBytes = observedBytes(outputBase, resolvedBase)
-                        val progressBytes = if (totalSize > 0uL) {
-                            (totalSize.toDouble() * progress.coerceIn(0f, 100f) / 100.0).toLong()
-                        } else partBytes
-                        val downloaded = maxOf(partBytes, progressBytes).coerceAtLeast(0L)
+                        // yt-dlp's percentage/file-size estimate may describe a single stream,
+                        // not the merged output. Count the actual files instead of inventing bytes.
+                        val actualBytes = observedBytes(outputBase, id, prefix)
                         val now = System.nanoTime()
                         val elapsed = (now - lastAt).coerceAtLeast(1L)
-                        val speed = ((downloaded - lastBytes).coerceAtLeast(0L) * 1_000_000_000L / elapsed)
+                        val speed = ((actualBytes - lastBytes).coerceAtLeast(0L) * 1_000_000_000L / elapsed)
                             .coerceAtLeast(0L)
-                        lastBytes = downloaded
+                        lastBytes = actualBytes
                         lastAt = now
                         update(id) {
                             it.copy(
-                                downloadedBytes = downloaded.toULong(),
+                                downloadedBytes = actualBytes.toULong(),
                                 speedBytesPerSec = speed.toULong(),
-                                totalBytes = if (totalSize > 0uL) maxOf(it.totalBytes, totalSize) else it.totalBytes
+                                totalBytes = 0u
                             )
                         }
                     }
                     Unit
                 }
                 if (!contains(id) || id in removedIds) return@launch
-                val finalFile = findFinalOutput(outputBase, resolvedBase)
-                val downloaded = finalFile?.length() ?: observedBytes(outputBase, resolvedBase)
+                val finalFile = findFinalOutput(outputBase, id, prefix)
                 if (id in pauseRequested) {
+                    val downloaded = observedBytes(outputBase, id, prefix)
                     update(id) {
                         it.copy(
                             state = DownloadState.PAUSED,
@@ -275,18 +291,30 @@ class YoutubeDownloadManager(
                         )
                     }
                 } else if (finalFile != null) {
+                    val displayFile = if (requestedName == null) {
+                        cleanGeneratedName(finalFile, prefix, id)
+                    } else finalFile
+                    val exactSize = displayFile.length().toULong()
                     update(id) {
                         it.copy(
                             state = DownloadState.COMPLETED,
-                            title = finalFile.name,
-                            savePath = finalFile.absolutePath,
-                            downloadedBytes = finalFile.length().toULong(),
-                            totalBytes = maxOf(it.totalBytes, finalFile.length().toULong()),
+                            title = displayFile.name,
+                            savePath = displayFile.absolutePath,
+                            downloadedBytes = exactSize,
+                            totalBytes = exactSize,
                             speedBytesPerSec = 0u,
                             errorMessage = null
                         )
                     }
+                    if (!subtitleLanguage.isNullOrBlank()) {
+                        val subtitleTemplate = File(
+                            displayFile.parentFile ?: outputBase,
+                            "${displayFile.nameWithoutExtension}.%(ext)s"
+                        ).absolutePath
+                        scope.launch { downloadSubtitle(source, subtitleLanguage, subtitleTemplate) }
+                    }
                 } else {
+                    val downloaded = observedBytes(outputBase, id, prefix)
                     update(id) {
                         it.copy(
                             state = DownloadState.FAILED,
@@ -300,9 +328,8 @@ class YoutubeDownloadManager(
                 if (!contains(id) || id in removedIds) return@launch
                 if (id in pauseRequested) {
                     val task = get(id)
-                    val currentPath = task?.savePath?.let(::File)
-                    val downloaded = currentPath?.takeIf { !it.absolutePath.endsWith(".pending") }
-                        ?.let { observedBytes(it.parentFile ?: downloadDir, it.nameWithoutExtension) } ?: 0L
+                    val prefix = task?.let { outputPrefix(it.id, it.savePath) }.orEmpty()
+                    val downloaded = observedBytes(downloadDir, id, prefix)
                     update(id) {
                         it.copy(
                             state = DownloadState.PAUSED,
@@ -313,9 +340,13 @@ class YoutubeDownloadManager(
                     }
                 } else {
                     val message = error.message?.take(240)?.ifBlank { null } ?: "yt-dlp 下载失败"
+                    val task = get(id)
+                    val prefix = task?.let { outputPrefix(it.id, it.savePath) }.orEmpty()
+                    val downloaded = observedBytes(downloadDir, id, prefix)
                     update(id) {
                         it.copy(
                             state = DownloadState.FAILED,
+                            downloadedBytes = maxOf(it.downloadedBytes, downloaded.toULong()),
                             speedBytesPerSec = 0u,
                             errorMessage = message
                         )
@@ -331,6 +362,42 @@ class YoutubeDownloadManager(
         job.start()
     }
 
+    private suspend fun downloadSubtitle(source: String, language: String, outputTemplate: String) {
+        runCatching {
+            val request = YoutubeDLRequest(source).apply {
+                addOption("--no-playlist")
+                addOption("--no-warnings")
+                addOption("--ignore-errors")
+                addOption("--skip-download")
+                addOption("--write-subs")
+                addOption("--write-auto-subs")
+                addOption("--sub-langs", language)
+                addOption("--sub-format", "vtt/best")
+                addOption("-o", outputTemplate)
+            }
+            YoutubeDL.getInstance().execute(request)
+        }
+    }
+
+    private fun cleanGeneratedName(file: File, prefix: String, id: String): File {
+        val guessed = sanitizeBaseName(file.name.removePrefix(prefix).substringBeforeLast('.'))
+        var destination = File(file.parentFile ?: downloadDir, "$guessed.${file.extension}")
+        if (destination.absolutePath != file.absolutePath && destination.exists()) {
+            val suffix = id.replace("-", "").take(6)
+            destination = File(file.parentFile ?: downloadDir, "${guessed}_$suffix.${file.extension}")
+            var attempt = 2
+            while (destination.exists()) {
+                destination = File(file.parentFile ?: downloadDir, "${guessed}_${suffix}_$attempt.${file.extension}")
+                attempt++
+            }
+        }
+        if (destination.absolutePath != file.absolutePath && file.renameTo(destination)) return destination
+        return file
+    }
+
+    private fun outputPrefix(id: String, savePath: String): String =
+        optionsPrefs.getString("$id.prefix", null) ?: File(savePath).nameWithoutExtension
+
     private fun sanitizeBaseName(value: String): String {
         val cleaned = value
             .replace(Regex("[\\\\/:*?\"<>|]"), "_")
@@ -340,11 +407,7 @@ class YoutubeDownloadManager(
             .take(160)
             .trim()
         val suffix = cleaned.substringAfterLast('.', "").lowercase()
-        val withoutExtension = if (suffix in VIDEO_EXTENSIONS) {
-            cleaned.substringBeforeLast('.').trim()
-        } else {
-            cleaned
-        }
+        val withoutExtension = if (suffix in VIDEO_EXTENSIONS) cleaned.substringBeforeLast('.').trim() else cleaned
         return withoutExtension.ifBlank { "youtube_video" }
     }
 
@@ -352,13 +415,9 @@ class YoutubeDownloadManager(
         val reserved = synchronized(lock) {
             tasks.values.asSequence()
                 .filter { it.id != id }
-                .mapNotNull {
-                    if (it.savePath.endsWith(".pending")) {
-                        it.title.takeUnless { title -> title == "正在解析 YouTube…" }
-                            ?.let(::sanitizeBaseName)
-                    } else {
-                        File(it.savePath).nameWithoutExtension
-                    }
+                .mapNotNull { task ->
+                    optionsPrefs.getString("${task.id}.prefix", null)
+                        ?: task.savePath.takeUnless { it.endsWith(".pending") }?.let { File(it).nameWithoutExtension }
                 }
                 .toSet()
         }
@@ -375,12 +434,20 @@ class YoutubeDownloadManager(
         return candidate
     }
 
-    private fun observedBytes(directory: File, baseName: String): Long =
-        (findFinalOutput(directory, baseName)?.length() ?: 0L).coerceAtLeast(
-            directory.listFiles()
-                ?.filter { it.name.startsWith("$baseName.") && it.name.endsWith(".part") }
-                ?.maxOfOrNull { it.length() } ?: 0L
-            )
+    private fun taskFileMatches(id: String, name: String, prefix: String): Boolean {
+        val hasCustomName = optionsPrefs.getString("$id.name", null) != null
+        return if (hasCustomName) name == "$prefix.pending" || name.startsWith("$prefix.")
+        else name.startsWith(prefix)
+    }
+
+    private fun observedBytes(directory: File, id: String, prefix: String): Long =
+        directory.listFiles()
+            ?.filter { file ->
+                file.isFile && taskFileMatches(id, file.name, prefix) &&
+                    (file.name.endsWith(".part") || file.extension.lowercase() in VIDEO_EXTENSIONS)
+            }
+            ?.sumOf { it.length() }
+            ?.coerceAtLeast(0L) ?: 0L
 
     private fun startQueuedTasks() {
         while (true) {
@@ -394,24 +461,20 @@ class YoutubeDownloadManager(
                 queued
             } ?: return
             publish()
-            start(next.id, next.requestedOutputName())
+            start(next.id)
         }
     }
 
-    private fun findFinalOutput(directory: File, baseName: String): File? =
+    private fun findFinalOutput(directory: File, id: String, prefix: String): File? =
         directory.listFiles()
-            ?.filter {
-                it.isFile && it.name.startsWith("$baseName.") &&
-                    !it.name.endsWith(".part") && !it.name.endsWith(".ytdl") &&
-                    !it.name.endsWith(".info.json") &&
-                    it.extension.lowercase() in VIDEO_EXTENSIONS
+            ?.filter { file ->
+                file.isFile && taskFileMatches(id, file.name, prefix) &&
+                    !file.name.endsWith(".part") && !file.name.endsWith(".ytdl") &&
+                    !file.name.endsWith(".info.json") && file.extension.lowercase() in VIDEO_EXTENSIONS
             }
             ?.maxByOrNull { it.lastModified() }
 
     private fun get(id: String): DownloadTask? = synchronized(lock) { tasks[id] }
-
-    private fun DownloadTask.requestedOutputName(): String? =
-        if (savePath.endsWith(".pending") && title == "正在解析 YouTube…") null else title
 
     private fun contains(id: String): Boolean = synchronized(lock) { tasks.containsKey(id) }
 

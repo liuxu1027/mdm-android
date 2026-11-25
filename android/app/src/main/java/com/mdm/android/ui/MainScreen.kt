@@ -1,14 +1,20 @@
 package com.mdm.android.ui
 
 import android.app.Activity
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
+import android.os.Environment
+import android.provider.DocumentsContract
 import android.provider.Settings
 import android.webkit.MimeTypeMap
 import android.widget.Toast
 import androidx.core.content.FileProvider
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
@@ -37,8 +43,12 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import com.mdm.android.service.DownloadForegroundService
 import com.mdm.android.service.YoutubeRuntime
+import com.mdm.android.service.YoutubeMediaResolver
 import uniffi.mdm_android.DownloadKind
 import uniffi.mdm_android.DownloadState
 import uniffi.mdm_android.DownloadTask
@@ -55,12 +65,57 @@ fun MainScreen(viewModel: MainViewModel) {
     var showStorageDialog by remember { mutableStateOf(false) }
     var pendingRemoveId by remember { mutableStateOf<String?>(null) }
     var selectedTaskId by remember { mutableStateOf<String?>(null) }
+    var fileOpsTaskId by remember { mutableStateOf<String?>(null) }
+    var propertiesTaskId by remember { mutableStateOf<String?>(null) }
+    var retryOptionsTaskId by remember { mutableStateOf<String?>(null) }
+    var pendingFileOperation by remember { mutableStateOf<String?>(null) }
     var renamingTaskId by remember { mutableStateOf<String?>(null) }
     var renameValue by remember { mutableStateOf("") }
     var renameError by remember { mutableStateOf<String?>(null) }
     val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
     val youtubeResolveState = viewModel.youtubeResolveState
     val hasActiveDownload = tasks.any { it.state == DownloadState.DOWNLOADING }
+    val folderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { treeUri ->
+        val operation = pendingFileOperation
+        val task = tasks.firstOrNull { it.id == fileOpsTaskId }
+        if (treeUri != null && operation != null && task != null) {
+            val permissionGranted = runCatching {
+                context.contentResolver.takePersistableUriPermission(
+                    treeUri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                )
+            }.isSuccess
+            if (!permissionGranted) {
+                Toast.makeText(context, "所选文件提供方不支持保留访问权限，已取消文件操作", Toast.LENGTH_LONG).show()
+                pendingFileOperation = null
+                fileOpsTaskId = null
+            } else {
+                coroutineScope.launch {
+                    val result = withContext(Dispatchers.IO) {
+                        runCatching { copyTaskFileToTree(context, task, treeUri, operation == "move") }
+                    }
+                    result.onSuccess { (destinationUri, fileName) ->
+                        if (operation == "move") {
+                            viewModel.updateTaskLocation(task.id, destinationUri.toString(), fileName)
+                        }
+                        Toast.makeText(
+                            context,
+                            if (operation == "move") "已移动：$fileName" else "已复制：$fileName",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }.onFailure { error ->
+                        Toast.makeText(context, "文件操作失败：${error.message ?: "未知错误"}", Toast.LENGTH_LONG).show()
+                    }
+                    pendingFileOperation = null
+                    fileOpsTaskId = null
+                }
+            }
+        } else {
+            pendingFileOperation = null
+            fileOpsTaskId = null
+        }
+    }
 
     // 打开“所有文件访问权限”的系统设置页（特殊应用权限，不在应用详情的常规权限里）。
     val openAllFilesAccess = {
@@ -158,9 +213,10 @@ fun MainScreen(viewModel: MainViewModel) {
 
     if (showAddDialog) {
         AddLinkDialog(
+            youtubeEnabled = YoutubeRuntime.youtubeEnabled,
             onDismiss = { showAddDialog = false },
-            onConfirm = { link, name ->
-                viewModel.addLink(link, name)
+            onConfirm = { link, name, height, audio ->
+                viewModel.addLink(link, name, height, audio)
                 showAddDialog = false
             }
         )
@@ -193,6 +249,8 @@ fun MainScreen(viewModel: MainViewModel) {
         is YoutubeResolveUiState.Ready -> YoutubePickerDialog(
             result = state.result,
             ffmpegEnabled = YoutubeRuntime.ffmpegEnabled,
+            initialTargetHeight = state.initialTargetHeight,
+            initialAudioCeiling = state.initialAudioCeiling,
             onDismiss = { viewModel.dismissYoutubePicker() },
             onDownload = { viewModel.addYoutubeDownloads(it) }
         )
@@ -200,6 +258,7 @@ fun MainScreen(viewModel: MainViewModel) {
 
     if (showSettings) {
         SettingsDialog(
+            youtubeEnabled = YoutubeRuntime.youtubeEnabled,
             maxConnections = viewModel.maxConnections,
             speedLimitBps = viewModel.speedLimitBps,
             uploadLimitBps = viewModel.uploadLimitBps,
@@ -292,38 +351,134 @@ fun MainScreen(viewModel: MainViewModel) {
             onDismissRequest = { selectedTaskId = null },
             title = { Text(selectedTask.title, maxLines = 2, overflow = TextOverflow.Ellipsis) },
             text = {
-                Column {
+                Column(modifier = Modifier.heightIn(max = 560.dp).verticalScroll(rememberScrollState())) {
                     TextButton(
-                        onClick = {
-                            selectedTaskId = null
-                            openDownloadedFile(context, selectedTask)
-                        },
+                        enabled = selectedTask.state == DownloadState.COMPLETED,
+                        onClick = { selectedTaskId = null; openDownloadedFile(context, selectedTask) },
                         modifier = Modifier.fillMaxWidth()
                     ) { Text("打开", modifier = Modifier.fillMaxWidth()) }
-                    if (selectedTask.kind != DownloadKind.YOUTUBE) {
-                        TextButton(
-                            onClick = {
-                                renameValue = selectedTask.title
-                                renameError = null
-                                renamingTaskId = selectedTask.id
-                                selectedTaskId = null
-                            },
-                            modifier = Modifier.fillMaxWidth()
-                        ) { Text("重命名", modifier = Modifier.fillMaxWidth()) }
-                    }
+                    TextButton(
+                        onClick = { selectedTaskId = null; shareTask(context, selectedTask) },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("分享", modifier = Modifier.fillMaxWidth()) }
+                    TextButton(
+                        enabled = selectedTask.state == DownloadState.COMPLETED,
+                        onClick = { selectedTaskId = null; openTaskFolder(context, selectedTask) },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("打开文件夹", modifier = Modifier.fillMaxWidth()) }
+                    TextButton(
+                        onClick = { selectedTaskId = null; viewModel.redownload(selectedTask) },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("重新下载", modifier = Modifier.fillMaxWidth()) }
                     TextButton(
                         onClick = {
-                            pendingRemoveId = selectedTask.id
                             selectedTaskId = null
+                            if (selectedTask.kind == DownloadKind.YOUTUBE) viewModel.retryOptions(selectedTask)
+                            else retryOptionsTaskId = selectedTask.id
                         },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("重下选项", modifier = Modifier.fillMaxWidth()) }
+                    TextButton(
+                        onClick = { pendingRemoveId = selectedTask.id; selectedTaskId = null },
                         modifier = Modifier.fillMaxWidth(),
                         colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)
                     ) { Text("删除", modifier = Modifier.fillMaxWidth()) }
+                    TextButton(
+                        onClick = {
+                            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                            clipboard.setPrimaryClip(ClipData.newPlainText("download URL", selectedTask.sourceUrl))
+                            Toast.makeText(context, "已复制下载链接", Toast.LENGTH_SHORT).show()
+                            selectedTaskId = null
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("复制下载链接", modifier = Modifier.fillMaxWidth()) }
+                    TextButton(
+                        enabled = selectedTask.state == DownloadState.COMPLETED,
+                        onClick = { fileOpsTaskId = selectedTask.id; selectedTaskId = null },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("复制/移动/重命名", modifier = Modifier.fillMaxWidth()) }
+                    TextButton(
+                        onClick = { propertiesTaskId = selectedTask.id; selectedTaskId = null },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("属性", modifier = Modifier.fillMaxWidth()) }
                 }
             },
             confirmButton = {
-                TextButton(onClick = { selectedTaskId = null }) { Text("取消") }
+                TextButton(onClick = { selectedTaskId = null }) { Text("关闭") }
             }
+        )
+    }
+    val fileOpsTask = tasks.firstOrNull { it.id == fileOpsTaskId }
+    if (fileOpsTask != null) {
+        AlertDialog(
+            onDismissRequest = { fileOpsTaskId = null },
+            title = { Text("复制/移动/重命名") },
+            text = {
+                Column {
+                    TextButton(
+                        onClick = {
+                            renameValue = fileOpsTask.title
+                            renameError = null
+                            renamingTaskId = fileOpsTask.id
+                            fileOpsTaskId = null
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("重命名", modifier = Modifier.fillMaxWidth()) }
+                    TextButton(
+                        onClick = {
+                            pendingFileOperation = "copy"
+                            folderPicker.launch(null)
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("复制到…", modifier = Modifier.fillMaxWidth()) }
+                    TextButton(
+                        onClick = {
+                            pendingFileOperation = "move"
+                            folderPicker.launch(null)
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("移动到…", modifier = Modifier.fillMaxWidth()) }
+                }
+            },
+            confirmButton = { TextButton(onClick = { fileOpsTaskId = null }) { Text("关闭") } }
+        )
+    }
+    val retryTask = tasks.firstOrNull { it.id == retryOptionsTaskId }
+    if (retryTask != null) {
+        AlertDialog(
+            onDismissRequest = { retryOptionsTaskId = null },
+            title = { Text("重下选项") },
+            text = { Text("此下载类型没有单独的画质或音频参数。将按原链接重新加入任务，并自动使用不冲突的文件名。") },
+            confirmButton = {
+                TextButton(onClick = { viewModel.redownload(retryTask); retryOptionsTaskId = null }) { Text("重新下载") }
+            },
+            dismissButton = { TextButton(onClick = { retryOptionsTaskId = null }) { Text("取消") } }
+        )
+    }
+    val propertiesTask = tasks.firstOrNull { it.id == propertiesTaskId }
+    if (propertiesTask != null) {
+        AlertDialog(
+            onDismissRequest = { propertiesTaskId = null },
+            title = { Text("属性") },
+            text = {
+                Column(modifier = Modifier.heightIn(max = 480.dp).verticalScroll(rememberScrollState())) {
+                    Text("名称：${propertiesTask.title}")
+                    Text("类型：${when (propertiesTask.kind) {
+                        DownloadKind.HTTP -> "HTTP/HTTPS"
+                        DownloadKind.TORRENT_MAGNET -> "磁力链接"
+                        DownloadKind.TORRENT_FILE -> "Torrent 文件"
+                        DownloadKind.HLS -> "HLS 视频"
+                        DownloadKind.YOUTUBE -> "YouTube"
+                    }}")
+                    Text("状态：${stateLabel(propertiesTask.state)}")
+                    Text("大小：${formatSize(propertiesTask.downloadedBytes.toLong())}")
+                    Text("路径：${propertiesTask.savePath}")
+                    Text("来源：${propertiesTask.sourceUrl}")
+                    val file = File(propertiesTask.savePath)
+                    if (file.exists()) Text("修改时间：${java.text.DateFormat.getDateTimeInstance().format(file.lastModified())}")
+                }
+            },
+            confirmButton = { TextButton(onClick = { propertiesTaskId = null }) { Text("关闭") } }
         )
     }
 
@@ -343,7 +498,7 @@ fun MainScreen(viewModel: MainViewModel) {
                     )
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        "仅支持已完成的 HTTP/HLS 文件；可自行保留或修改扩展名。",
+                        "仅支持已完成的文件；扩展名会保留。",
                         style = MaterialTheme.typography.bodySmall
                     )
                     if (renameError != null) {
@@ -507,18 +662,19 @@ private fun stateLabel(state: DownloadState): String = when (state) {
 
 private fun openDownloadedFile(context: Context, task: DownloadTask) {
     val taskPath = File(task.savePath)
-    val file = if (taskPath.isDirectory) findPlayableFile(taskPath) else taskPath
-    if (file == null || !file.exists()) {
+    val file = if (task.savePath.startsWith("content://")) null
+    else if (taskPath.isDirectory) findPlayableFile(taskPath) else taskPath
+    if (file?.exists() != true && !task.savePath.startsWith("content://")) {
         Toast.makeText(context, "暂未找到可打开的下载文件", Toast.LENGTH_SHORT).show()
         return
     }
     try {
-        val uri = FileProvider.getUriForFile(
+        val uri = if (task.savePath.startsWith("content://")) Uri.parse(task.savePath) else FileProvider.getUriForFile(
             context,
             "${context.packageName}.fileprovider",
-            file
+            file!!
         )
-        val extension = file.extension.lowercase()
+        val extension = task.title.substringAfterLast('.', file?.extension.orEmpty()).lowercase()
         val mimeType = MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension) ?: "*/*"
         val intent = Intent(Intent.ACTION_VIEW).apply {
             setDataAndType(uri, mimeType)
@@ -528,6 +684,119 @@ private fun openDownloadedFile(context: Context, task: DownloadTask) {
     } catch (_: Exception) {
         Toast.makeText(context, "没有可打开此文件的应用", Toast.LENGTH_SHORT).show()
     }
+}
+
+private fun shareTask(context: Context, task: DownloadTask) {
+    try {
+        val uri = if (task.savePath.startsWith("content://")) Uri.parse(task.savePath) else {
+            val file = File(task.savePath)
+            if (!file.isFile) {
+                val intent = Intent(Intent.ACTION_SEND).apply {
+                    type = "text/plain"
+                    putExtra(Intent.EXTRA_TEXT, task.sourceUrl)
+                }
+                context.startActivity(Intent.createChooser(intent, "分享下载链接"))
+                return
+            }
+            FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+        }
+        val extension = task.title.substringAfterLast('.', "").lowercase()
+        val mimeType = MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension) ?: "*/*"
+        val intent = Intent(Intent.ACTION_SEND).apply {
+            type = mimeType
+            putExtra(Intent.EXTRA_STREAM, uri)
+            clipData = ClipData.newUri(context.contentResolver, task.title, uri)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        context.startActivity(Intent.createChooser(intent, "分享文件"))
+    } catch (_: Exception) {
+        Toast.makeText(context, "暂时无法分享此文件", Toast.LENGTH_SHORT).show()
+    }
+}
+
+private fun openTaskFolder(context: Context, task: DownloadTask) {
+    if (task.savePath.startsWith("content://")) {
+        runCatching {
+            val documentUri = Uri.parse(task.savePath)
+            val path = DocumentsContract.findDocumentPath(context.contentResolver, documentUri).path
+            val parentId = path.dropLast(1).lastOrNull() ?: error("无法定位上级目录")
+            val folderUri = if (DocumentsContract.isTreeUri(documentUri)) {
+                DocumentsContract.buildDocumentUriUsingTree(documentUri, parentId)
+            } else {
+                DocumentsContract.buildDocumentUri(documentUri.authority ?: error("无法识别文件提供方"), parentId)
+            }
+            context.startActivity(Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+                putExtra(DocumentsContract.EXTRA_INITIAL_URI, folderUri)
+            })
+        }.onFailure {
+            Toast.makeText(context, "无法打开此系统目录，请在文件管理器中查看", Toast.LENGTH_LONG).show()
+        }
+        return
+    }
+    val folder = File(task.savePath).parentFile
+    if (folder == null || !folder.exists()) {
+        Toast.makeText(context, "找不到下载文件夹", Toast.LENGTH_SHORT).show()
+        return
+    }
+    val publicDownloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+    val folderPath = folder.absoluteFile.path
+    val publicPath = publicDownloads.absoluteFile.path
+    if (folderPath == publicPath || folderPath.startsWith("$publicPath${File.separator}")) {
+        runCatching {
+            val relative = if (folderPath == publicPath) "" else folder.relativeTo(publicDownloads).invariantSeparatorsPath
+            val documentId = listOf("Download", relative).filter { it.isNotBlank() }.joinToString("/")
+            val folderUri = DocumentsContract.buildDocumentUri(
+                "com.android.externalstorage.documents",
+                "primary:$documentId"
+            )
+            context.startActivity(Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+                putExtra(DocumentsContract.EXTRA_INITIAL_URI, folderUri)
+            })
+        }.onFailure {
+            Toast.makeText(context, "无法打开下载文件夹：${it.message ?: "未知错误"}", Toast.LENGTH_LONG).show()
+        }
+    } else {
+        Toast.makeText(context, "此目录位于应用私有存储中，无法在系统文件管理器中直接打开", Toast.LENGTH_LONG).show()
+    }
+}
+
+private fun copyTaskFileToTree(
+    context: Context,
+    task: DownloadTask,
+    treeUri: Uri,
+    move: Boolean
+): Pair<Uri, String> {
+    val taskFile = if (task.savePath.startsWith("content://")) null else File(task.savePath)
+    val sourceFile = if (taskFile?.isDirectory == true) findPlayableFile(taskFile) else taskFile
+    val sourceUri = task.savePath.takeIf { it.startsWith("content://") }?.let(Uri::parse)
+    require(sourceFile?.isFile == true || sourceUri != null) { "找不到可复制的文件" }
+    val fileName = sourceFile?.name ?: task.title
+    val extension = fileName.substringAfterLast('.', "").lowercase()
+    val mimeType = MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension) ?: "application/octet-stream"
+    val parent = DocumentsContract.buildDocumentUriUsingTree(treeUri, DocumentsContract.getTreeDocumentId(treeUri))
+    val destination = DocumentsContract.createDocument(context.contentResolver, parent, mimeType, fileName)
+        ?: error("无法在所选目录创建文件")
+    val treeDocument = DocumentsContract.buildDocumentUriUsingTree(
+        treeUri,
+        DocumentsContract.getDocumentId(destination)
+    )
+    try {
+        val input = sourceFile?.inputStream() ?: context.contentResolver.openInputStream(sourceUri!!)
+            ?: error("无法读取源文件")
+        input.use { source ->
+            context.contentResolver.openOutputStream(treeDocument, "w")?.use { output ->
+                source.copyTo(output)
+            } ?: error("无法写入目标文件")
+        }
+    } catch (error: Exception) {
+        runCatching { DocumentsContract.deleteDocument(context.contentResolver, treeDocument) }
+        throw error
+    }
+    if (move) {
+        if (sourceFile != null) check(sourceFile.delete()) { "复制完成，但无法删除原文件" }
+        else check(context.contentResolver.delete(sourceUri!!, null, null) > 0) { "复制完成，但无法删除原文件" }
+    }
+    return treeDocument to fileName
 }
 
 private fun findPlayableFile(root: File): File? {
@@ -548,14 +817,23 @@ private fun findPlayableFile(root: File): File? {
 }
 
 @Composable
-private fun AddLinkDialog(onDismiss: () -> Unit, onConfirm: (String, String?) -> Unit) {
+private fun AddLinkDialog(
+    youtubeEnabled: Boolean,
+    onDismiss: () -> Unit,
+    onConfirm: (String, String?, Int?, Int?) -> Unit
+) {
     var text by remember { mutableStateOf("") }
     var fileName by remember { mutableStateOf("") }
+    var selectedHeight by remember { mutableStateOf<Int?>(null) }
+    var selectedAudio by remember { mutableStateOf<Int?>(null) }
+    val isYoutube = isYouTubePageLink(text)
+    val heights = listOf(360, 480, 720, 1080, 1440, 2160)
+    val audioBitrates = YoutubeMediaResolver.audioBitrateChoices
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("新建下载任务") },
         text = {
-            Column {
+            Column(modifier = Modifier.heightIn(max = 520.dp).verticalScroll(rememberScrollState())) {
                 OutlinedTextField(
                     value = text,
                     onValueChange = {
@@ -574,15 +852,70 @@ private fun AddLinkDialog(onDismiss: () -> Unit, onConfirm: (String, String?) ->
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
+                if (isYoutube && youtubeEnabled) {
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Text("视频清晰度", style = MaterialTheme.typography.titleSmall)
+                    Row(
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        heights.forEach { height ->
+                            FilterChip(
+                                selected = selectedHeight == height,
+                                onClick = { selectedHeight = if (selectedHeight == height) null else height },
+                                label = {
+                                    Text(when (height) {
+                                        1440 -> "2K · 1440p"
+                                        2160 -> "4K · 2160p"
+                                        else -> "${height}p"
+                                    })
+                                }
+                            )
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text("音频码率", style = MaterialTheme.typography.titleSmall)
+                    Row(
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        audioBitrates.forEach { bitrate ->
+                            FilterChip(
+                                selected = selectedAudio == bitrate,
+                                onClick = { selectedAudio = if (selectedAudio == bitrate) null else bitrate },
+                                label = { Text("${bitrate}k") }
+                            )
+                        }
+                    }
+                    Text(
+                        if (selectedHeight != null && selectedAudio != null && !isYouTubePlaylistLink(text))
+                            "已选清晰度与音频：点“开始下载”后直接启动；所选档位不可用时自动降到下一档。"
+                        else if (isYouTubePlaylistLink(text))
+                            "播放列表仍会先读取条目，供你多选或全选后开始下载。"
+                        else
+                            "清晰度和音频都选好后可直接启动；未选齐时先解析，再确认视频与字幕。",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                } else if (isYoutube) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text("Lite 版不支持 YouTube 下载，请使用 Full 版。", style = MaterialTheme.typography.bodySmall)
+                }
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    "YouTube 会先解析视频与播放列表信息，再选择清晰度、音频、字幕和下载条目；同名文件不会覆盖已有文件。",
+                    "未选齐清晰度和音频时，YouTube 会先解析视频信息；播放列表需选择下载条目。同名文件不会覆盖已有文件。",
                     style = MaterialTheme.typography.bodySmall
                 )
             }
         },
         confirmButton = {
-            TextButton(onClick = { onConfirm(text, fileName.ifBlank { null }) }) { Text("开始下载") }
+            TextButton(onClick = {
+                onConfirm(
+                    text,
+                    fileName.ifBlank { null },
+                    selectedHeight,
+                    selectedAudio
+                )
+            }) { Text("开始下载") }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) { Text("取消") }
@@ -606,6 +939,7 @@ private fun formatSize(bytes: Long): String = when {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun SettingsDialog(
+    youtubeEnabled: Boolean,
     maxConnections: Int,
     speedLimitBps: Long,
     uploadLimitBps: Long,
@@ -829,14 +1163,16 @@ private fun SettingsDialog(
                         style = MaterialTheme.typography.bodySmall
                     )
                 }
-                Column {
-                    Text("yt-dlp 视频解析", style = MaterialTheme.typography.titleSmall)
-                    Text(
-                        "更新检查为手动操作，只使用 Stable，不会自动切换到 Nightly。",
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                    TextButton(onClick = onCheckYtDlpUpdates) {
-                        Text("检查 yt-dlp 更新（Stable）")
+                if (youtubeEnabled) {
+                    Column {
+                        Text("yt-dlp 视频解析", style = MaterialTheme.typography.titleSmall)
+                        Text(
+                            "更新检查为手动操作，只使用 Stable，不会自动切换到 Nightly。",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        TextButton(onClick = onCheckYtDlpUpdates) {
+                            Text("检查 yt-dlp 更新（Stable）")
+                        }
                     }
                 }
             }

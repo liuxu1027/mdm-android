@@ -3,6 +3,8 @@ package com.mdm.android.ui
 import android.app.Application
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
+import android.provider.DocumentsContract
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
@@ -13,6 +15,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.mdm.android.service.DownloadForegroundService
 import com.mdm.android.service.EngineRegistry
+import com.mdm.android.service.YoutubeRuntime
 import com.mdm.android.service.YoutubeDownloadSpec
 import com.mdm.android.service.YoutubeMediaResolver
 import com.mdm.android.service.YoutubeResolveResult
@@ -22,11 +25,16 @@ import kotlinx.coroutines.launch
 import uniffi.mdm_android.DownloadKind
 import uniffi.mdm_android.DownloadState
 import uniffi.mdm_android.DownloadTask
+import java.io.File
 
 sealed class YoutubeResolveUiState {
     object Idle : YoutubeResolveUiState()
     object Loading : YoutubeResolveUiState()
-    data class Ready(val result: YoutubeResolveResult) : YoutubeResolveUiState()
+    data class Ready(
+        val result: YoutubeResolveResult,
+        val initialTargetHeight: Int? = null,
+        val initialAudioCeiling: Int? = null
+    ) : YoutubeResolveUiState()
     data class Failed(val message: String) : YoutubeResolveUiState()
 }
 
@@ -170,11 +178,32 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         prefs.edit().putString("download_location", v).apply()
     }
 
-    fun addLink(rawInput: String, filename: String? = null) {
+    fun addLink(
+        rawInput: String,
+        filename: String? = null,
+        targetHeight: Int? = null,
+        audioCeiling: Int? = null
+    ) {
         val trimmed = rawInput.trim()
         if (trimmed.isEmpty()) return
         if (isYouTubePageLink(trimmed)) {
-            resolveYoutubeLink(trimmed, filename)
+            if (!YoutubeRuntime.youtubeEnabled) {
+                youtubeResolveState = YoutubeResolveUiState.Failed("Lite 版不支持 YouTube 下载，请使用 Full 版。")
+                return
+            }
+            if (targetHeight != null && audioCeiling != null && !isYouTubePlaylistLink(trimmed)) {
+                youtubeRequestedName = filename?.trim()?.takeIf { it.isNotBlank() }
+                val spec = YoutubeMediaResolver.directSpec(
+                    url = trimmed,
+                    requestedName = youtubeRequestedName,
+                    targetHeight = targetHeight,
+                    audioCeiling = audioCeiling,
+                    ffmpegEnabled = YoutubeRuntime.ffmpegEnabled
+                )
+                addYoutubeDownloads(listOf(spec))
+            } else {
+                resolveYoutubeLink(trimmed, filename, targetHeight, audioCeiling)
+            }
             return
         }
         val ctx = getApplication<Application>()
@@ -194,14 +223,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         ContextCompat.startForegroundService(ctx, intent)
     }
 
-    fun resolveYoutubeLink(url: String, filename: String? = null) {
+    fun resolveYoutubeLink(
+        url: String,
+        filename: String? = null,
+        targetHeight: Int? = null,
+        audioCeiling: Int? = null
+    ) {
+        if (!YoutubeRuntime.youtubeEnabled) {
+            youtubeResolveState = YoutubeResolveUiState.Failed("Lite 版不支持 YouTube 下载，请使用 Full 版。")
+            return
+        }
         youtubeResolveJob?.cancel()
         youtubeRequestedName = filename?.trim()?.takeIf { it.isNotBlank() }
         youtubeResolveState = YoutubeResolveUiState.Loading
         youtubeResolveJob = viewModelScope.launch {
             try {
                 val result = YoutubeMediaResolver.resolve(getApplication(), url.trim())
-                youtubeResolveState = YoutubeResolveUiState.Ready(result)
+                youtubeResolveState = YoutubeResolveUiState.Ready(result, targetHeight, audioCeiling)
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Exception) {
@@ -236,6 +274,27 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         dismissYoutubePicker()
     }
 
+    fun redownload(task: DownloadTask) {
+        if (task.kind == DownloadKind.YOUTUBE) {
+            val ctx = getApplication<Application>()
+            val intent = Intent(ctx, DownloadForegroundService::class.java).apply {
+                action = DownloadForegroundService.ACTION_REDOWNLOAD_YOUTUBE
+                putExtra(DownloadForegroundService.EXTRA_TASK_ID, task.id)
+            }
+            ContextCompat.startForegroundService(ctx, intent)
+        } else {
+            addLink(task.sourceUrl, task.title)
+        }
+    }
+
+    fun retryOptions(task: DownloadTask) {
+        if (task.kind == DownloadKind.YOUTUBE) {
+            resolveYoutubeLink(task.sourceUrl)
+        } else {
+            redownload(task)
+        }
+    }
+
     /** 彻底退出：停掉下载服务、去掉通知栏，界面随后关闭。 */
     fun exit() {
         val ctx = getApplication<Application>()
@@ -262,7 +321,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun remove(id: String, deleteFiles: Boolean) {
-        if (tasks.value.firstOrNull { it.id == id }?.kind == DownloadKind.YOUTUBE) {
+        val task = tasks.value.firstOrNull { it.id == id }
+        if (task?.savePath?.startsWith("content://") == true) {
+            if (deleteFiles) {
+                runCatching { getApplication<Application>().contentResolver.delete(Uri.parse(task.savePath), null, null) }
+            }
+            val ctx = getApplication<Application>()
+            val intent = Intent(ctx, DownloadForegroundService::class.java).apply {
+                action = DownloadForegroundService.ACTION_REMOVE_EXTERNAL_TASK
+                putExtra(DownloadForegroundService.EXTRA_TASK_ID, id)
+            }
+            ContextCompat.startForegroundService(ctx, intent)
+            return
+        }
+        if (task?.kind == DownloadKind.YOUTUBE) {
             val ctx = getApplication<Application>()
             val intent = Intent(ctx, DownloadForegroundService::class.java).apply {
                 action = DownloadForegroundService.ACTION_REMOVE_YOUTUBE
@@ -286,8 +358,58 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun rename(id: String, newTitle: String): Result<Unit> = runCatching {
         require(newTitle.isNotBlank()) { "文件名不能为空" }
+        val task = tasks.value.firstOrNull { it.id == id } ?: error("找不到下载任务")
+        if (task.savePath.startsWith("content://")) {
+            val extension = task.title.substringAfterLast('.', "")
+                .takeIf { it.isNotBlank() && task.title.lastIndexOf('.') > 0 }
+            val enteredName = newTitle.trim()
+            val preservedName = if (extension == null) enteredName
+            else "${enteredName.substringBeforeLast('.', enteredName)}.$extension"
+            val renamed = DocumentsContract.renameDocument(
+                getApplication<Application>().contentResolver,
+                Uri.parse(task.savePath),
+                preservedName
+            ) ?: error("系统文件管理器无法重命名此文件")
+            updateTaskLocation(id, renamed.toString(), preservedName)
+            return@runCatching
+        }
+        if (task.kind == DownloadKind.YOUTUBE) {
+            val source = File(task.savePath)
+            require(source.isFile) { "找不到下载文件，无法重命名" }
+            val extension = source.extension.takeIf { it.isNotBlank() }
+            val enteredName = newTitle.trim()
+            val baseName = if (extension == null) enteredName else enteredName.substringBeforeLast('.', enteredName)
+            val destination = File(source.parentFile, buildString {
+                append(baseName)
+                if (extension != null) append(".$extension")
+            })
+            require(source.absolutePath == destination.absolutePath || !destination.exists()) { "同名文件已存在，请换一个名称" }
+            if (source.absolutePath != destination.absolutePath) {
+                check(source.renameTo(destination)) { "重命名失败" }
+            }
+            val cleanBase = destination.nameWithoutExtension
+            getApplication<Application>()
+                .getSharedPreferences("youtube_download_options", Context.MODE_PRIVATE)
+                .edit()
+                .putString("$id.name", cleanBase)
+                .putString("$id.prefix", cleanBase)
+                .apply()
+            updateTaskLocation(id, destination.absolutePath, destination.name)
+            return@runCatching
+        }
         val engine = EngineRegistry.engine ?: error("下载引擎尚未启动")
         engine.renameTask(id, newTitle.trim())
+    }
+
+    fun updateTaskLocation(id: String, path: String, title: String) {
+        val ctx = getApplication<Application>()
+        val intent = Intent(ctx, DownloadForegroundService::class.java).apply {
+            action = DownloadForegroundService.ACTION_UPDATE_TASK_LOCATION
+            putExtra(DownloadForegroundService.EXTRA_TASK_ID, id)
+            putExtra(DownloadForegroundService.EXTRA_TASK_PATH, path)
+            putExtra(DownloadForegroundService.EXTRA_FILENAME, title)
+        }
+        ContextCompat.startForegroundService(ctx, intent)
     }
 
     fun clearFinished() {

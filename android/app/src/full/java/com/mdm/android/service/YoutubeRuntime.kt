@@ -5,6 +5,7 @@ import com.yausername.ffmpeg.FFmpeg
 import com.yausername.youtubedl_android.YoutubeDL
 
 object YoutubeRuntime {
+    const val youtubeEnabled = true
     const val ffmpegEnabled = true
 
     fun init(context: Context) {

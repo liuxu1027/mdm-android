@@ -44,36 +44,48 @@ import com.mdm.android.service.YoutubeResolveResult
 fun YoutubePickerDialog(
     result: YoutubeResolveResult,
     ffmpegEnabled: Boolean,
+    initialTargetHeight: Int? = null,
+    initialAudioCeiling: Int? = null,
     onDismiss: () -> Unit,
     onDownload: (List<YoutubeDownloadSpec>) -> Unit
 ) {
-    val state = remember(result, ffmpegEnabled) { PickerState(result, ffmpegEnabled) }
-    val heightOptions = listOf(
+    val heights = listOf(
         HeightOption("360p", 360),
+        HeightOption("480p", 480),
         HeightOption("720p", 720),
         HeightOption("1080p", 1080),
-        HeightOption("最高画质", null)
+        HeightOption("2K · 1440p", 1440),
+        HeightOption("4K · 2160p", 2160)
     )
-    val audioOptions: List<ChoiceOption<Int?>> = remember(result, ffmpegEnabled) {
-        listOf(ChoiceOption<Int?>("最佳音质", null)) + state.audioBitrates.map {
-            ChoiceOption("≤ $it kbps", it)
-        }
+    val state = remember(result, ffmpegEnabled) { PickerState(result) }
+    val audioOptions: List<ChoiceOption<Int?>> = remember(result) {
+        listOf(ChoiceOption<Int?>("最高音质", null)) +
+            (YoutubeMediaResolver.audioBitrateChoices + state.audioBitrates)
+                .distinct()
+                .sortedDescending()
+                .map { ChoiceOption("≤ $it kbps", it) }
     }
     val subtitleOptions: List<ChoiceOption<String?>> = remember(result) {
-        if (state.subtitleLanguages.isEmpty()) {
-            listOf(ChoiceOption<String?>("无字幕", ""))
-        } else {
-            listOf(
-                ChoiceOption<String?>("默认（中文优先）", null),
-                ChoiceOption<String?>("不下载字幕", "")
-            ) + state.subtitleLanguages.map { ChoiceOption(it, it) }
-        }
+        listOf(
+            ChoiceOption<String?>("自动选择（中文优先）", null),
+            ChoiceOption<String?>("不下载字幕", "")
+        ) + state.subtitleLanguages.map { ChoiceOption(it, it) }
     }
-    var selectedHeight by remember(result) { mutableIntStateOf(-1) }
-    var selectedAudio by remember(result) { mutableIntStateOf(-1) }
+    var selectedHeight by remember(result, initialTargetHeight) {
+        mutableIntStateOf(heights.indexOfFirst { it.height == initialTargetHeight })
+    }
+    var selectedAudio by remember(result, initialAudioCeiling) {
+        mutableIntStateOf(audioOptions.indexOfFirst { it.value == initialAudioCeiling }
+            .takeIf { initialAudioCeiling != null } ?: -1)
+    }
     var selectedSubtitle by remember(result) { mutableIntStateOf(0) }
-    var selectedUrls by remember(result) { mutableStateOf(emptySet<String>()) }
-    val canSelectVideos = selectedHeight >= 0 && selectedAudio >= 0
+    var selectedUrls by remember(result) {
+        mutableStateOf(if (result.isPlaylist) emptySet() else result.entries.firstOrNull()?.url?.let { setOf(it) }.orEmpty())
+    }
+    val canChooseVideos = selectedHeight >= 0 && selectedAudio >= 0
+    val canStart = canChooseVideos && selectedUrls.isNotEmpty()
+    val targetHeight = heights.getOrNull(selectedHeight)?.height
+    val audioCeiling = audioOptions.getOrNull(selectedAudio)?.value
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -86,7 +98,7 @@ fun YoutubePickerDialog(
                 )
                 if (result.isPlaylist) {
                     Text(
-                        text = "播放列表信息已解析",
+                        text = "播放列表已快速读取；视频清晰度会在下载时匹配，字幕缺失不会中断视频。",
                         style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -99,12 +111,12 @@ fun YoutubePickerDialog(
                     .fillMaxWidth()
                     .heightIn(min = 260.dp, max = 560.dp)
             ) {
-                Text("清晰度", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                Text("视频清晰度", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
                 Row(
                     modifier = Modifier.horizontalScroll(rememberScrollState()),
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    heightOptions.forEachIndexed { index, option ->
+                    heights.forEachIndexed { index, option ->
                         FilterChip(
                             selected = selectedHeight == index,
                             onClick = { selectedHeight = index },
@@ -113,7 +125,7 @@ fun YoutubePickerDialog(
                     }
                 }
                 ChoiceDropdown(
-                    title = "音频",
+                    title = "音频码率",
                     options = audioOptions,
                     selectedIndex = selectedAudio,
                     onSelectedIndexChange = { selectedAudio = it }
@@ -126,7 +138,7 @@ fun YoutubePickerDialog(
                 )
                 if (!ffmpegEnabled) {
                     Text(
-                        "Lite 仅下载原本带音频的视频流；Full 可用 FFmpeg 合并分离的音视频流。",
+                        "Full 版可合并分离的视频和音频流。",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -138,25 +150,26 @@ fun YoutubePickerDialog(
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Text(
-                        text = if (result.isPlaylist) "选择列表视频" else "确认视频",
+                        text = if (result.isPlaylist) "选择列表视频" else "视频",
                         style = MaterialTheme.typography.titleSmall,
                         fontWeight = FontWeight.SemiBold
                     )
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        TextButton(
-                            enabled = canSelectVideos,
-                            onClick = { selectedUrls = state.entries.map { it.url }.toSet() }
-                        ) {
-                            Text("全选")
-                        }
-                        TextButton(enabled = canSelectVideos, onClick = { selectedUrls = emptySet() }) {
-                            Text("清空")
+                    if (result.isPlaylist) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            TextButton(
+                                enabled = canChooseVideos,
+                                onClick = { selectedUrls = state.entries.map { it.url }.toSet() }
+                            ) {
+                                Text("全选")
+                            }
+                            TextButton(enabled = canChooseVideos, onClick = { selectedUrls = emptySet() }) { Text("清空") }
                         }
                     }
                 }
                 Text(
-                    text = if (canSelectVideos) "已选择 ${selectedUrls.size}/${state.entries.size}"
-                    else "请先选择清晰度和音频，再勾选下载条目",
+                    text = if (result.isPlaylist && !canChooseVideos) "请先选择清晰度和音频，再勾选列表视频。"
+                    else if (result.isPlaylist) "已选择 ${selectedUrls.size}/${state.entries.size}"
+                    else "预估大小仅在 yt-dlp 提供文件大小时显示；实际以下载完成文件为准。",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -166,10 +179,17 @@ fun YoutubePickerDialog(
                         .weight(1f)
                 ) {
                     items(state.entries, key = { it.url }) { entry ->
+                        val estimated = YoutubeMediaResolver.estimatedSize(
+                            entry = entry,
+                            targetHeight = targetHeight ?: 2160,
+                            audioCeiling = audioCeiling,
+                            ffmpegEnabled = ffmpegEnabled
+                        )
                         YoutubeEntryRow(
                             entry = entry,
+                            estimatedSize = estimated,
                             checked = entry.url in selectedUrls,
-                            enabled = canSelectVideos,
+                            enabled = result.isPlaylist && canChooseVideos,
                             onCheckedChange = { checked ->
                                 selectedUrls = if (checked) selectedUrls + entry.url else selectedUrls - entry.url
                             }
@@ -180,17 +200,18 @@ fun YoutubePickerDialog(
         },
         confirmButton = {
             Button(
-                enabled = canSelectVideos && selectedUrls.isNotEmpty(),
+                enabled = canStart,
                 onClick = {
-                    val specs = YoutubeMediaResolver.buildSpecs(
-                        result = result,
-                        selectedUrls = selectedUrls,
-                        targetHeight = heightOptions.getOrNull(selectedHeight)?.height,
-                        audioCeiling = audioOptions.getOrNull(selectedAudio)?.value,
-                        ffmpegEnabled = ffmpegEnabled,
-                        subtitleLanguageOverride = subtitleOptions[selectedSubtitle].value
+                    onDownload(
+                        YoutubeMediaResolver.buildSpecs(
+                            result = result,
+                            selectedUrls = selectedUrls,
+                            targetHeight = targetHeight,
+                            audioCeiling = audioCeiling,
+                            ffmpegEnabled = ffmpegEnabled,
+                            subtitleLanguageOverride = subtitleOptions[selectedSubtitle].value
+                        )
                     )
-                    onDownload(specs)
                 }
             ) { Text("开始下载") }
         },
@@ -234,19 +255,22 @@ private fun <T> ChoiceDropdown(
 @Composable
 private fun YoutubeEntryRow(
     entry: YoutubeMediaEntry,
+    estimatedSize: Long?,
     checked: Boolean,
     enabled: Boolean,
     onCheckedChange: (Boolean) -> Unit
 ) {
     val bestHeight = entry.formats.mapNotNull { it.height }.maxOrNull() ?: 0
-    val subtitles = entry.subtitleLanguages.distinct()
+    val subtitles = entry.allSubtitleLanguages.distinct()
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .padding(vertical = 3.dp),
         verticalAlignment = Alignment.Top
     ) {
-        Checkbox(checked = checked, enabled = enabled, onCheckedChange = onCheckedChange)
+        if (enabled) {
+            Checkbox(checked = checked, enabled = true, onCheckedChange = onCheckedChange)
+        }
         Column(modifier = Modifier.padding(top = 11.dp, end = 4.dp)) {
             Text(
                 text = entry.title,
@@ -256,9 +280,17 @@ private fun YoutubeEntryRow(
             )
             Text(
                 text = buildString {
-                    append(if (bestHeight > 0) "最高 ${bestHeight}p" else "无可用视频")
+                    if (bestHeight > 0) append("最高 ${bestHeight}p")
+                    else append("下载时匹配所选清晰度")
                     append(" · ")
-                    append(if (subtitles.isEmpty()) "无字幕" else "字幕：${subtitles.joinToString(", ")}")
+                    append(
+                        when {
+                            subtitles.isNotEmpty() -> "字幕：${subtitles.joinToString(", ")}"
+                            entry.formats.isEmpty() -> "下载时自动检测字幕（无字幕会跳过）"
+                            else -> "未发现字幕（会跳过）"
+                        }
+                    )
+                    estimatedSize?.let { append(" · 约 ${formatSize(it)}") }
                 },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -267,28 +299,29 @@ private fun YoutubeEntryRow(
     }
 }
 
-private data class HeightOption(val label: String, val height: Int?)
+private fun formatSize(bytes: Long): String = when {
+    bytes >= 1024L * 1024 * 1024 -> String.format("%.2f GB", bytes / (1024.0 * 1024.0 * 1024.0))
+    bytes >= 1024L * 1024 -> String.format("%.1f MB", bytes / (1024.0 * 1024.0))
+    bytes >= 1024 -> String.format("%.1f KB", bytes / 1024.0)
+    else -> "$bytes B"
+}
+
+private data class HeightOption(val label: String, val height: Int)
 private data class ChoiceOption<T>(val label: String, val value: T)
 
-private class PickerState(result: YoutubeResolveResult, ffmpegEnabled: Boolean) {
+private class PickerState(result: YoutubeResolveResult) {
     val entries: List<YoutubeMediaEntry> = result.entries
     val audioBitrates: List<Int> = entries
-        .flatMap { entry ->
-            entry.formats.filter { format ->
-                ffmpegEnabled || (!format.vcodec.isNullOrBlank() &&
-                    !format.vcodec.equals("none", true) &&
-                    !format.acodec.isNullOrBlank() && !format.acodec.equals("none", true))
-            }.mapNotNull { format -> format.abr?.toInt() }
-        }
+        .flatMap { entry -> entry.formats.filter { format ->
+            !format.acodec.isNullOrBlank() && !format.acodec.equals("none", true) &&
+                (format.vcodec.isNullOrBlank() || format.vcodec.equals("none", true))
+        }.mapNotNull { it.abr?.toInt() } }
         .filter { it > 0 }
         .distinct()
-        .sortedDescending()
-        .take(8)
     val subtitleLanguages: List<String> = entries
-        .flatMap { it.subtitleLanguages }
+        .flatMap { it.allSubtitleLanguages }
         .distinct()
         .sortedWith(compareBy<String> { !it.startsWith("zh", ignoreCase = true) }
             .thenBy { !it.startsWith("en", ignoreCase = true) }
             .thenBy { it })
-        .take(10)
 }

@@ -46,6 +46,31 @@ object EngineRegistry {
     }
 
     @Synchronized
+    fun updateTask(id: String, transform: (DownloadTask) -> DownloadTask): Boolean {
+        val youtubeIndex = youtubeTasks.indexOfFirst { it.id == id }
+        if (youtubeIndex >= 0) {
+            youtubeTasks = youtubeTasks.toMutableList().also { it[youtubeIndex] = transform(it[youtubeIndex]) }
+            publishCombined()
+            return true
+        }
+        val nativeIndex = nativeTasks.indexOfFirst { it.id == id }
+        if (nativeIndex < 0) return false
+        nativeTasks = nativeTasks.toMutableList().also { it[nativeIndex] = transform(it[nativeIndex]) }
+        publishCombined()
+        return true
+    }
+
+    @Synchronized
+    fun removeTask(id: String): Boolean {
+        val existed = nativeTasks.any { it.id == id } || youtubeTasks.any { it.id == id }
+        if (!existed) return false
+        nativeTasks = nativeTasks.filterNot { it.id == id }
+        youtubeTasks = youtubeTasks.filterNot { it.id == id }
+        publishCombined()
+        return true
+    }
+
+    @Synchronized
     fun addYoutube(task: DownloadTask) {
         youtubeTasks = youtubeTasks.filterNot { it.id == task.id } + task
         publishCombined()

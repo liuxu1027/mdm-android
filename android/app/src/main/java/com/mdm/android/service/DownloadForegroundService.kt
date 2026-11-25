@@ -53,17 +53,26 @@ class DownloadForegroundService : Service(), ProgressListener {
             setHlsParallelSegments(prefs.getInt("hls_parallel_segments", 8).toUInt())
         }
         EngineRegistry.attach(engine!!)
-        youtubeManager = YoutubeDownloadManager(this, downloadDir) { youtubeTasks ->
-            EngineRegistry.publishYoutube(youtubeTasks)
-            runCatching { taskStore.saveThrottled(EngineRegistry.tasks.value) }
-            refreshNotification()
-        }
+        youtubeManager = if (YoutubeRuntime.youtubeEnabled) {
+            YoutubeDownloadManager(this, downloadDir) { youtubeTasks ->
+                EngineRegistry.publishYoutube(youtubeTasks)
+                runCatching { taskStore.saveThrottled(EngineRegistry.tasks.value) }
+                refreshNotification()
+            }
+        } else null
         // 先从库里恢复任务，再接监听，避免空任务快照清空数据库。
         runCatching {
             val saved = taskStore.loadAll()
-            saved.filter { it.kind != uniffi.mdm_android.DownloadKind.YOUTUBE }
+            val externalTasks = saved.filter {
+                it.kind != uniffi.mdm_android.DownloadKind.YOUTUBE && it.savePath.startsWith("content://")
+            }
+            val externalIds = externalTasks.mapTo(mutableSetOf()) { it.id }
+            saved.filter {
+                it.kind != uniffi.mdm_android.DownloadKind.YOUTUBE && !it.savePath.startsWith("content://")
+            }
                 .forEach { task -> runCatching { engine?.restoreTask(task) } }
-            EngineRegistry.publish(engine?.listTasks().orEmpty())
+            val nativeTasks = engine?.listTasks().orEmpty().filterNot { it.id in externalIds }
+            EngineRegistry.publish(nativeTasks + externalTasks)
             youtubeManager?.restore(saved.filter { it.kind == uniffi.mdm_android.DownloadKind.YOUTUBE })
         }
         engine?.setListener(this@DownloadForegroundService)
@@ -92,7 +101,7 @@ class DownloadForegroundService : Service(), ProgressListener {
             }
             ACTION_ADD_YOUTUBE -> {
                 val url = intent.getStringExtra(EXTRA_URL)
-                if (!url.isNullOrBlank()) {
+                if (YoutubeRuntime.youtubeEnabled && !url.isNullOrBlank()) {
                     youtubeManager?.add(url, intent.getStringExtra(EXTRA_FILENAME))
                 }
             }
@@ -101,13 +110,15 @@ class DownloadForegroundService : Service(), ProgressListener {
                 val names = intent.getStringArrayListExtra(EXTRA_YOUTUBE_NAMES).orEmpty()
                 val formats = intent.getStringArrayListExtra(EXTRA_YOUTUBE_FORMATS).orEmpty()
                 val subtitles = intent.getStringArrayListExtra(EXTRA_YOUTUBE_SUBTITLES).orEmpty()
-                urls.forEachIndexed { index, url ->
-                    youtubeManager?.add(
-                        url,
-                        names.getOrNull(index),
-                        formats.getOrNull(index),
-                        subtitles.getOrNull(index)?.takeIf { it.isNotBlank() }
-                    )
+                if (YoutubeRuntime.youtubeEnabled) {
+                    urls.forEachIndexed { index, url ->
+                        youtubeManager?.add(
+                            url,
+                            names.getOrNull(index),
+                            formats.getOrNull(index),
+                            subtitles.getOrNull(index)?.takeIf { it.isNotBlank() }
+                        )
+                    }
                 }
             }
             ACTION_PAUSE_YOUTUBE -> intent.getStringExtra(EXTRA_TASK_ID)?.let { youtubeManager?.pause(it) }
@@ -115,7 +126,37 @@ class DownloadForegroundService : Service(), ProgressListener {
             ACTION_REMOVE_YOUTUBE -> intent.getStringExtra(EXTRA_TASK_ID)?.let { id ->
                 youtubeManager?.remove(id, intent.getBooleanExtra(EXTRA_DELETE_FILES, false))
             }
-            ACTION_UPDATE_YTDLP -> checkYoutubeDLUpdates()
+            ACTION_REMOVE_EXTERNAL_TASK -> intent.getStringExtra(EXTRA_TASK_ID)?.let { id ->
+                val task = EngineRegistry.tasks.value.firstOrNull { it.id == id }
+                if (task?.kind == uniffi.mdm_android.DownloadKind.YOUTUBE) {
+                    youtubeManager?.remove(id, false)
+                } else {
+                    runCatching { engine?.removeTask(id, false) }
+                    EngineRegistry.removeTask(id)
+                }
+                runCatching { taskStore.saveNow(EngineRegistry.tasks.value) }
+            }
+            ACTION_REDOWNLOAD_YOUTUBE -> intent.getStringExtra(EXTRA_TASK_ID)?.let { youtubeManager?.redownload(it) }
+            ACTION_RENAME_YOUTUBE -> {
+                val id = intent.getStringExtra(EXTRA_TASK_ID)
+                val name = intent.getStringExtra(EXTRA_FILENAME)
+                if (!id.isNullOrBlank() && !name.isNullOrBlank()) youtubeManager?.rename(id, name)
+            }
+            ACTION_UPDATE_TASK_LOCATION -> {
+                val id = intent.getStringExtra(EXTRA_TASK_ID)
+                val path = intent.getStringExtra(EXTRA_TASK_PATH)
+                val title = intent.getStringExtra(EXTRA_FILENAME)
+                if (!id.isNullOrBlank() && !path.isNullOrBlank() && !title.isNullOrBlank()) {
+                    val task = EngineRegistry.tasks.value.firstOrNull { it.id == id }
+                    if (task?.kind == uniffi.mdm_android.DownloadKind.YOUTUBE) {
+                        youtubeManager?.updateLocation(id, path, title)
+                    } else {
+                        EngineRegistry.updateTask(id) { it.copy(savePath = path, title = title) }
+                    }
+                    runCatching { taskStore.saveNow(EngineRegistry.tasks.value) }
+                }
+            }
+            ACTION_UPDATE_YTDLP -> if (YoutubeRuntime.youtubeEnabled) checkYoutubeDLUpdates()
             ACTION_EXIT -> {
                 youtubeManager?.shutdown()
                 runCatching { taskStore.saveNow(EngineRegistry.tasks.value) }
@@ -128,7 +169,13 @@ class DownloadForegroundService : Service(), ProgressListener {
     }
 
     override fun onTasksUpdated(tasks: List<DownloadTask>) {
-        EngineRegistry.publish(tasks)
+        val previous = EngineRegistry.tasks.value.associateBy { it.id }
+        val incomingIds = tasks.mapTo(mutableSetOf()) { it.id }
+        val merged = tasks.map { task ->
+            val external = previous[task.id]?.takeIf { it.savePath.startsWith("content://") }
+            if (external == null) task else task.copy(savePath = external.savePath, title = external.title)
+        } + previous.values.filter { it.savePath.startsWith("content://") && it.id !in incomingIds }
+        EngineRegistry.publish(merged)
         runCatching { taskStore.saveThrottled(EngineRegistry.tasks.value) }
         refreshNotification()
     }
@@ -240,11 +287,16 @@ class DownloadForegroundService : Service(), ProgressListener {
         const val ACTION_PAUSE_YOUTUBE = "com.mdm.android.PAUSE_YOUTUBE"
         const val ACTION_RESUME_YOUTUBE = "com.mdm.android.RESUME_YOUTUBE"
         const val ACTION_REMOVE_YOUTUBE = "com.mdm.android.REMOVE_YOUTUBE"
+        const val ACTION_REMOVE_EXTERNAL_TASK = "com.mdm.android.REMOVE_EXTERNAL_TASK"
+        const val ACTION_REDOWNLOAD_YOUTUBE = "com.mdm.android.REDOWNLOAD_YOUTUBE"
+        const val ACTION_RENAME_YOUTUBE = "com.mdm.android.RENAME_YOUTUBE"
+        const val ACTION_UPDATE_TASK_LOCATION = "com.mdm.android.UPDATE_TASK_LOCATION"
         const val ACTION_UPDATE_YTDLP = "com.mdm.android.UPDATE_YTDLP"
         const val ACTION_EXIT = "com.mdm.android.EXIT"
         const val EXTRA_URL = "extra_url"
         const val EXTRA_FILENAME = "extra_filename"
         const val EXTRA_TASK_ID = "extra_task_id"
+        const val EXTRA_TASK_PATH = "extra_task_path"
         const val EXTRA_DELETE_FILES = "extra_delete_files"
         const val EXTRA_YOUTUBE_URLS = "extra_youtube_urls"
         const val EXTRA_YOUTUBE_NAMES = "extra_youtube_names"

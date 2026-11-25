@@ -17,8 +17,12 @@ data class YoutubeMediaFormat(
     val acodec: String?,
     val abr: Double?,
     val tbr: Double?,
-    val formatNote: String?
-)
+    val formatNote: String?,
+    val fileSize: Long?,
+    val approximateFileSize: Long?
+) {
+    val estimatedSize: Long? get() = fileSize ?: approximateFileSize
+}
 
 data class YoutubeMediaEntry(
     val id: String,
@@ -26,8 +30,12 @@ data class YoutubeMediaEntry(
     val url: String,
     val durationSeconds: Double?,
     val formats: List<YoutubeMediaFormat>,
-    val subtitleLanguages: List<String>
-)
+    val subtitleLanguages: List<String>,
+    val automaticSubtitleLanguages: List<String>
+) {
+    val allSubtitleLanguages: List<String>
+        get() = (subtitleLanguages + automaticSubtitleLanguages).distinct()
+}
 
 data class YoutubeResolveResult(
     val title: String,
@@ -44,14 +52,21 @@ data class YoutubeDownloadSpec(
 
 /** Resolves yt-dlp metadata and turns a user's selection into a download specification. */
 object YoutubeMediaResolver {
+    val qualityHeights = listOf(360, 480, 720, 1080, 1440, 2160)
+    val audioBitrateChoices = listOf(48, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320)
+
     suspend fun resolve(context: Context, url: String): YoutubeResolveResult = withContext(Dispatchers.IO) {
         initRuntime(context)
+        val isPlaylistUrl = url.contains("list=", ignoreCase = true) ||
+            url.contains("/playlist", ignoreCase = true)
         val request = YoutubeDLRequest(url).apply {
             addOption("--dump-single-json")
             addOption("--skip-download")
             addOption("--no-warnings")
             addOption("--ignore-errors")
-            // Deliberately do not add --no-playlist: yt-dlp must return playlist entries.
+            // Playlist entries need only their flat IDs/titles here; resolving every format
+            // individually made large lists take minutes and is unnecessary for selection.
+            if (isPlaylistUrl) addOption("--flat-playlist")
         }
         val response = YoutubeDL.getInstance().execute(request)
         val output = response.out.orEmpty()
@@ -60,6 +75,21 @@ object YoutubeMediaResolver {
         check(result.entries.isNotEmpty()) { "解析结果中没有可下载的视频" }
         result
     }
+
+    fun directSpec(
+        url: String,
+        requestedName: String?,
+        targetHeight: Int,
+        audioCeiling: Int?,
+        ffmpegEnabled: Boolean
+    ): YoutubeDownloadSpec = YoutubeDownloadSpec(
+        url = url,
+        title = requestedName?.trim().orEmpty(),
+        formatSelector = formatSelector(targetHeight, audioCeiling, ffmpegEnabled),
+        // Without a metadata pass, let yt-dlp try every manual/automatic caption language.
+        // Caption retrieval runs after the video and is non-fatal when no captions exist.
+        subtitleLanguage = "all"
+    )
 
     fun buildSpecs(
         result: YoutubeResolveResult,
@@ -70,36 +100,60 @@ object YoutubeMediaResolver {
         subtitleLanguageOverride: String? = null
     ): List<YoutubeDownloadSpec> {
         return result.entries.filter { selectedUrls.isEmpty() || it.url in selectedUrls }.map { entry ->
-            val videoFormats = entry.formats.filter { isVideo(it) && (it.height ?: 0) > 0 }
-            val video = videoFormats.let { formats ->
-                if (formats.isEmpty()) null else chooseVideo(formats, targetHeight)
-            }
-            val progressive = entry.formats.filter { isVideo(it) && hasAudio(it) && (it.height ?: 0) > 0 }
-            val audio = entry.formats.filter(::isAudio)
-            val fullVideo = if (ffmpegEnabled) {
-                videoFormats.filter { it.acodec.equals("none", ignoreCase = true) }
-                    .let { formats -> if (formats.isEmpty()) video else chooseVideo(formats, targetHeight) }
-            } else video
-            val selector = if (ffmpegEnabled && fullVideo != null && audio.isNotEmpty()) {
-                val chosenAudio = chooseAudio(audio, audioCeiling)
-                if (chosenAudio != null && !hasAudio(fullVideo)) {
-                    "${fullVideo.formatId}+${chosenAudio.formatId}"
-                } else if (hasAudio(fullVideo)) {
-                    fullVideo.formatId
-                } else {
-                    fallbackSelector(targetHeight, true)
-                }
-            } else {
-                chooseProgressive(progressive, targetHeight, audioCeiling)?.formatId
-                    ?: fallbackSelector(targetHeight, false)
-            }
             YoutubeDownloadSpec(
                 url = entry.url,
                 title = entry.title,
-                formatSelector = selector,
+                formatSelector = formatSelector(targetHeight, audioCeiling, ffmpegEnabled),
                 subtitleLanguage = chooseSubtitle(entry, subtitleLanguageOverride)
             )
         }
+    }
+
+    /** Best available estimate for the selected video/audio tiers, when yt-dlp exposed sizes. */
+    fun estimatedSize(
+        entry: YoutubeMediaEntry,
+        targetHeight: Int?,
+        audioCeiling: Int?,
+        ffmpegEnabled: Boolean
+    ): Long? {
+        if (entry.formats.isEmpty()) return null
+        val videoFormats = entry.formats.filter { isVideo(it) && (it.height ?: 0) > 0 }
+        val target = targetHeight ?: Int.MAX_VALUE
+        val video = videoFormats.filter { (it.height ?: 0) <= target }
+            .maxWithOrNull(formatComparator)
+            ?: videoFormats.minWithOrNull(formatComparator)
+            ?: return null
+        val progressive = video.takeIf { hasAudio(it) }
+        if (progressive != null) return progressive.estimatedSize
+        if (!ffmpegEnabled) return null
+        val audio = entry.formats.filter(::isAudio)
+            .filter { audioCeiling == null || (it.abr ?: it.tbr ?: 0.0) <= audioCeiling }
+            .maxWithOrNull(audioComparator)
+            ?: entry.formats.filter(::isAudio).minWithOrNull(audioComparator)
+        val videoSize = video.estimatedSize
+        val audioSize = audio?.estimatedSize
+        return when {
+            videoSize != null && audioSize != null -> videoSize + audioSize
+            videoSize != null -> videoSize
+            else -> audioSize
+        }
+    }
+
+    private fun formatSelector(targetHeight: Int?, audioCeiling: Int?, ffmpegEnabled: Boolean): String {
+        val cap = targetHeight ?: 2160
+        val steps = qualityHeights.filter { it <= cap }.asReversed().ifEmpty { listOf(cap) }
+        val audioFilter = audioCeiling?.let { "[abr<=$it]" }.orEmpty()
+        val choices = mutableListOf<String>()
+        steps.forEach { height ->
+            if (ffmpegEnabled) {
+                choices += "bestvideo[height<=$height]+bestaudio$audioFilter"
+                // If no stream fits the chosen audio cap, keep the video and use the next
+                // available audio bitrate rather than failing the whole download.
+                if (audioCeiling != null) choices += "bestvideo[height<=$height]+bestaudio"
+            }
+            choices += "best[height<=$height]"
+        }
+        return choices.distinct().joinToString("/")
     }
 
     private fun parseResult(root: JSONObject, sourceUrl: String): YoutubeResolveResult {
@@ -137,7 +191,9 @@ object YoutubeMediaResolver {
                     acodec = format.text("acodec"),
                     abr = format.decimal("abr"),
                     tbr = format.decimal("tbr"),
-                    formatNote = format.text("format_note")
+                    formatNote = format.text("format_note"),
+                    fileSize = format.longValue("filesize"),
+                    approximateFileSize = format.longValue("filesize_approx")
                 )
             }
         }
@@ -147,49 +203,19 @@ object YoutubeMediaResolver {
             url = url,
             durationSeconds = node.decimal("duration"),
             formats = formats,
-            subtitleLanguages = languageKeys(node.optJSONObject("subtitles"))
+            subtitleLanguages = languageKeys(node.optJSONObject("subtitles")),
+            automaticSubtitleLanguages = languageKeys(node.optJSONObject("automatic_captions"))
         )
     }
 
-    private fun chooseVideo(formats: List<YoutubeMediaFormat>, targetHeight: Int?): YoutubeMediaFormat {
-        val ordered = formats.sortedWith(formatComparator)
-        if (targetHeight == null) return ordered.maxWithOrNull(formatComparator) ?: ordered.first()
-        return ordered.filter { (it.height ?: Int.MAX_VALUE) <= targetHeight }
-            .maxWithOrNull(formatComparator) ?: ordered.minWithOrNull(formatComparator)!!
-    }
-
-    private fun chooseAudio(formats: List<YoutubeMediaFormat>, ceiling: Int?): YoutubeMediaFormat {
-        val ordered = formats.sortedWith(audioComparator)
-        if (ceiling == null) return ordered.maxWithOrNull(audioComparator) ?: ordered.first()
-        return ordered.filter { (it.abr ?: it.tbr ?: 0.0) <= ceiling }
-            .maxWithOrNull(audioComparator) ?: ordered.minWithOrNull(audioComparator)!!
-    }
-
-    private fun chooseProgressive(
-        formats: List<YoutubeMediaFormat>,
-        targetHeight: Int?,
-        audioCeiling: Int?
-    ): YoutubeMediaFormat? {
-        if (formats.isEmpty()) return null
-        val capped = audioCeiling?.let { ceiling ->
-            formats.filter { (it.abr ?: it.tbr ?: 0.0) <= ceiling }
-        }.orEmpty().ifEmpty { formats }
-        return chooseVideo(capped, targetHeight)
-    }
-
     private fun chooseSubtitle(entry: YoutubeMediaEntry, override: String?): String? {
-        val all = entry.subtitleLanguages
+        val all = entry.allSubtitleLanguages
         if (override == "") return null
         if (override != null) return all.firstOrNull { it.equals(override, ignoreCase = true) }
         return all.firstOrNull { it.startsWith("zh", ignoreCase = true) }
             ?: all.firstOrNull { it.startsWith("en", ignoreCase = true) }
             ?: all.firstOrNull()
-    }
-
-    private fun fallbackSelector(targetHeight: Int?, withAudioMerge: Boolean): String {
-        val video = targetHeight?.let { "bestvideo[height<=$it]" } ?: "bestvideo"
-        if (withAudioMerge) return "$video+bestaudio/best"
-        return if (targetHeight == null) "best" else "best[height<=$targetHeight]/best"
+            ?: "all"
     }
 
     private fun isVideo(format: YoutubeMediaFormat): Boolean =
@@ -214,6 +240,12 @@ object YoutubeMediaResolver {
     }
 
     private fun JSONObject.int(name: String): Int? = (opt(name) as? Number)?.toInt()
+
+    private fun JSONObject.longValue(name: String): Long? = when (val value = opt(name)) {
+        is Number -> value.toLong()
+        is String -> value.toLongOrNull()
+        else -> null
+    }
 
     private fun JSONObject.decimal(name: String): Double? = (opt(name) as? Number)?.toDouble()
 
