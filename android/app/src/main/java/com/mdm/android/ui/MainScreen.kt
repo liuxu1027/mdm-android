@@ -79,6 +79,13 @@ fun MainScreen(viewModel: MainViewModel) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
     val youtubeResolveState = viewModel.youtubeResolveState
+    val batchMessage = viewModel.batchMessage
+    LaunchedEffect(batchMessage) {
+        batchMessage?.let {
+            Toast.makeText(context, it, Toast.LENGTH_LONG).show()
+            viewModel.consumeBatchMessage()
+        }
+    }
     DisposableEffect(context) {
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) {
@@ -239,7 +246,27 @@ fun MainScreen(viewModel: MainViewModel) {
             youtubeEnabled = YoutubeRuntime.youtubeEnabled,
             onDismiss = { showAddDialog = false },
             onConfirm = { link, name, height, audio ->
-                viewModel.addLink(link, name, height, audio)
+                val lines = link.lines().map { it.trim() }.filter { it.isNotEmpty() }
+                when {
+                    lines.size == 1 && isYouTubePageLink(lines[0]) -> {
+                        viewModel.addLink(link, name, height, audio)
+                    }
+                    lines.size == 1 && isPpnixSeriesPage(lines[0]) -> {
+                        Toast.makeText(context, "正在读取剧集信息…", Toast.LENGTH_SHORT).show()
+                        viewModel.resolveSeriesPage(lines[0])
+                    }
+                    else -> {
+                        val result = viewModel.addLinks(link, name)
+                        val skipped = result.skippedYoutube + result.skippedSeries
+                        if (result.added > 0 || skipped > 0) {
+                            val message = buildString {
+                                append("已添加 ${result.added} 个任务")
+                                if (skipped > 0) append("，跳过 $skipped 条（YouTube 链接和剧集页请逐条添加）")
+                            }
+                            Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+                        }
+                    }
+                }
                 showAddDialog = false
             }
         )
@@ -854,7 +881,9 @@ private fun AddLinkDialog(
     var fileName by remember { mutableStateOf("") }
     var selectedHeight by remember { mutableStateOf<Int?>(null) }
     var selectedAudio by remember { mutableStateOf<Int?>(null) }
-    val isYoutube = isYouTubePageLink(text)
+    val lineCount = text.lines().map { it.trim() }.count { it.isNotEmpty() }
+    val isMultiLine = lineCount > 1
+    val isYoutube = lineCount == 1 && isYouTubePageLink(text)
     val heights = listOf(360, 480, 720, 1080, 1440, 2160)
     val audioBitrates = YoutubeMediaResolver.audioBitrateChoices
     AlertDialog(
@@ -869,22 +898,31 @@ private fun AddLinkDialog(
                     },
                     label = {
                         Text(
-                            if (youtubeEnabled) "输入 YouTube 视频/播放列表、HTTP/HTTPS 直链、magnet:? 或 .m3u8 链接"
-                            else "输入 HTTP/HTTPS 直链、magnet:? 或 .m3u8 链接"
+                            if (youtubeEnabled) "输入链接，可多行粘贴（每行一个）：YouTube、直链、magnet:?、.m3u8"
+                            else "输入链接，可多行粘贴（每行一个）：直链、magnet:?、.m3u8"
                         )
                     },
                     singleLine = false,
-                    maxLines = 4,
+                    maxLines = 8,
                     modifier = Modifier.fillMaxWidth()
                 )
-                Spacer(modifier = Modifier.height(8.dp))
-                OutlinedTextField(
-                    value = fileName,
-                    onValueChange = { fileName = it },
-                    label = { Text("文件名（可选，空着按链接取名）") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
+                if (isMultiLine) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        "已输入 $lineCount 行，将一次添加 $lineCount 个任务（YouTube 链接和剧集页请逐条添加）。",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+                if (!isMultiLine) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = fileName,
+                        onValueChange = { fileName = it },
+                        label = { Text("文件名（可选，空着按链接取名）") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
                 if (isYoutube && youtubeEnabled) {
                     Spacer(modifier = Modifier.height(10.dp))
                     Text("视频清晰度", style = MaterialTheme.typography.titleSmall)
