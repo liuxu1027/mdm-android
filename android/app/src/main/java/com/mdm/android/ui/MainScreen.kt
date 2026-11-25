@@ -718,7 +718,8 @@ private fun openTaskFolder(context: Context, task: DownloadTask) {
     if (task.savePath.startsWith("content://")) {
         runCatching {
             val documentUri = Uri.parse(task.savePath)
-            val path = DocumentsContract.findDocumentPath(context.contentResolver, documentUri).path
+            val path = DocumentsContract.findDocumentPath(context.contentResolver, documentUri)?.path
+                ?: error("无法定位文件路径")
             val parentId = path.dropLast(1).lastOrNull() ?: error("无法定位上级目录")
             val folderUri = if (DocumentsContract.isTreeUri(documentUri)) {
                 DocumentsContract.buildDocumentUriUsingTree(documentUri, parentId)
