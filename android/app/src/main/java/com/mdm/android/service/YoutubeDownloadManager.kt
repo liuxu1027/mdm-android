@@ -32,6 +32,13 @@ class YoutubeDownloadManager(
     private val processIds = ConcurrentHashMap<String, String>()
     private val pauseRequested = ConcurrentHashMap.newKeySet<String>()
     private val removedIds = ConcurrentHashMap.newKeySet<String>()
+    @Volatile
+    private var maxActiveDownloads = 2
+
+    fun setMaxActiveDownloads(value: Int) {
+        maxActiveDownloads = value.coerceIn(0, 8)
+        startQueuedTasks()
+    }
 
     fun restore(saved: List<DownloadTask>) {
         synchronized(lock) {
@@ -56,7 +63,7 @@ class YoutubeDownloadManager(
         requestedName: String?,
         formatSelector: String? = null,
         subtitleLanguage: String? = null
-    ) {
+    ): String {
         val id = UUID.randomUUID().toString()
         val cleanRequestedName = requestedName?.takeIf { it.isNotBlank() }?.let(::sanitizeBaseName)
         val prefix = cleanRequestedName?.let { uniqueBaseName(downloadDir, it, id) }
@@ -85,6 +92,7 @@ class YoutubeDownloadManager(
         synchronized(lock) { tasks[id] = task }
         publish()
         startQueuedTasks()
+        return id
     }
 
     fun redownload(id: String) {
@@ -462,7 +470,7 @@ class YoutubeDownloadManager(
     private fun startQueuedTasks() {
         while (true) {
             val next = synchronized(lock) {
-                if (tasks.values.count { it.state == DownloadState.DOWNLOADING } >= MAX_ACTIVE_DOWNLOADS) {
+                if (tasks.values.count { it.state == DownloadState.DOWNLOADING } >= maxActiveDownloads) {
                     return@synchronized null
                 }
                 val queued = tasks.values.firstOrNull { it.state == DownloadState.QUEUED }
@@ -503,7 +511,6 @@ class YoutubeDownloadManager(
 
     companion object {
         private const val DEFAULT_FORMAT = "best[ext=mp4]/best"
-        private const val MAX_ACTIVE_DOWNLOADS = 2
         private val VIDEO_EXTENSIONS = setOf("mp4", "m4v", "webm", "mkv", "mov", "3gp", "flv")
     }
 }

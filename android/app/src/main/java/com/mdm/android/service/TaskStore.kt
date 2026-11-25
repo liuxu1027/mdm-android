@@ -8,6 +8,7 @@ import android.os.SystemClock
 import uniffi.mdm_android.DownloadKind
 import uniffi.mdm_android.DownloadState
 import uniffi.mdm_android.DownloadTask
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 
 /**
@@ -21,6 +22,7 @@ class TaskStore(context: Context) :
     // 所有写操作串在一根单线程上，避免并发写乱序。
     private val writer = Executors.newSingleThreadExecutor()
     private val writeLock = Any()
+    private val createdAtById = ConcurrentHashMap<String, Long>()
 
     @Volatile
     private var lastSavedAtMs = 0L
@@ -39,12 +41,15 @@ class TaskStore(context: Context) :
                 "state TEXT NOT NULL, " +
                 "total_bytes INTEGER NOT NULL, " +
                 "downloaded_bytes INTEGER NOT NULL, " +
-                "error_message TEXT)"
+                "error_message TEXT, " +
+                "created_at INTEGER NOT NULL DEFAULT 0)"
         )
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        // 只有 v1，暂无升级路径；以后加字段在这里处理。
+        if (oldVersion < 2) {
+            db.execSQL("ALTER TABLE $TABLE ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0")
+        }
     }
 
     /** 读出全部已保存的任务记录（启动恢复用）。 */
@@ -62,7 +67,9 @@ class TaskStore(context: Context) :
             val iTotal = it.getColumnIndexOrThrow("total_bytes")
             val iDone = it.getColumnIndexOrThrow("downloaded_bytes")
             val iErr = it.getColumnIndexOrThrow("error_message")
+            val iCreatedAt = it.getColumnIndexOrThrow("created_at")
             while (it.moveToNext()) {
+                createdAtById[it.getString(iId)] = it.getLong(iCreatedAt)
                 val kind = kindFromString(it.getString(iKind)) ?: continue
                 val state = stateFromString(it.getString(iState))
                 out.add(
@@ -84,6 +91,13 @@ class TaskStore(context: Context) :
             }
         }
         return out
+    }
+
+    @Synchronized
+    fun creationTimes(): Map<String, Long> = createdAtById.toMap()
+
+    fun noteTaskCreated(id: String, createdAt: Long = System.currentTimeMillis()) {
+        createdAtById[id] = createdAt
     }
 
     /**
@@ -129,6 +143,7 @@ class TaskStore(context: Context) :
                         put("total_bytes", t.totalBytes.toLong())
                         put("downloaded_bytes", t.downloadedBytes.toLong())
                         put("error_message", t.errorMessage)
+                        put("created_at", createdAtById.computeIfAbsent(t.id) { System.currentTimeMillis() })
                     }
                     db.insertWithOnConflict(TABLE, null, v, SQLiteDatabase.CONFLICT_REPLACE)
                 }
@@ -146,6 +161,8 @@ class TaskStore(context: Context) :
             } finally {
                 db.endTransaction()
             }
+            val retainedIds = tasks.mapTo(mutableSetOf()) { it.id }
+            createdAtById.keys.removeIf { it !in retainedIds }
         }
     }
 
@@ -157,7 +174,7 @@ class TaskStore(context: Context) :
 
     companion object {
         private const val DB_NAME = "mdm_tasks.db"
-        private const val DB_VERSION = 1
+        private const val DB_VERSION = 2
         private const val TABLE = "tasks"
         private const val PROGRESS_SAVE_INTERVAL_MS = 2000L
     }

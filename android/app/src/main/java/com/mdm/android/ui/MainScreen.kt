@@ -1,10 +1,12 @@
 package com.mdm.android.ui
 
 import android.app.Activity
+import android.content.BroadcastReceiver
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
@@ -13,6 +15,7 @@ import android.provider.Settings
 import android.webkit.MimeTypeMap
 import android.widget.Toast
 import androidx.core.content.FileProvider
+import androidx.core.content.ContextCompat
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.LinearEasing
@@ -76,6 +79,21 @@ fun MainScreen(viewModel: MainViewModel) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
     val youtubeResolveState = viewModel.youtubeResolveState
+    DisposableEffect(context) {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                intent?.getStringExtra(DownloadForegroundService.EXTRA_YTDLP_STATUS)
+                    ?.let(viewModel::onYtDlpUpdateStatus)
+            }
+        }
+        ContextCompat.registerReceiver(
+            context,
+            receiver,
+            IntentFilter(DownloadForegroundService.ACTION_YTDLP_STATUS),
+            ContextCompat.RECEIVER_NOT_EXPORTED
+        )
+        onDispose { context.unregisterReceiver(receiver) }
+    }
     val hasActiveDownload = tasks.any { it.state == DownloadState.DOWNLOADING }
     val folderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { treeUri ->
         val operation = pendingFileOperation
@@ -145,8 +163,11 @@ fun MainScreen(viewModel: MainViewModel) {
 
     val filteredTasks = remember(tasks, selectedTab) {
         when (selectedTab) {
-            1 -> tasks.filter { it.kind == DownloadKind.HTTP }
-            2 -> tasks.filter { it.kind != DownloadKind.HTTP }
+            1 -> tasks.filter {
+                it.state == DownloadState.DOWNLOADING || it.state == DownloadState.QUEUED
+            }
+            2 -> tasks.filter { it.kind == DownloadKind.HLS || it.kind == DownloadKind.YOUTUBE }
+            3 -> tasks.filter { it.kind != DownloadKind.HLS && it.kind != DownloadKind.YOUTUBE }
             else -> tasks
         }
     }
@@ -157,7 +178,7 @@ fun MainScreen(viewModel: MainViewModel) {
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Mister Download Manager") },
+                title = { Text("MDM") },
                 actions = {
                     if (hasFinished) {
                         IconButton(onClick = { viewModel.clearFinished() }) {
@@ -184,8 +205,9 @@ fun MainScreen(viewModel: MainViewModel) {
         Column(modifier = Modifier.padding(padding).fillMaxSize()) {
             TabRow(selectedTabIndex = selectedTab) {
                 Tab(selected = selectedTab == 0, onClick = { selectedTab = 0 }, text = { Text("全部") })
-                Tab(selected = selectedTab == 1, onClick = { selectedTab = 1 }, text = { Text("HTTP/HTTPS") })
-                Tab(selected = selectedTab == 2, onClick = { selectedTab = 2 }, text = { Text("磁力 / 视频") })
+                Tab(selected = selectedTab == 1, onClick = { selectedTab = 1 }, text = { Text("下载中") })
+                Tab(selected = selectedTab == 2, onClick = { selectedTab = 2 }, text = { Text("视频") })
+                Tab(selected = selectedTab == 3, onClick = { selectedTab = 3 }, text = { Text("其他") })
             }
 
             if (filteredTasks.isEmpty()) {
@@ -269,6 +291,9 @@ fun MainScreen(viewModel: MainViewModel) {
             retryAlways = viewModel.retryAlways,
             removeAds = viewModel.removeAds,
             hlsParallelSegments = viewModel.hlsParallelSegments,
+            maxConcurrentTasks = viewModel.maxConcurrentTasks,
+            ytDlpUpdateStatus = viewModel.ytDlpUpdateStatus,
+            checkingYtDlpUpdate = viewModel.checkingYtDlpUpdate,
             downloadDir = viewModel.downloadDir,
             downloadLocation = viewModel.downloadLocation,
             hasAllFilesAccess = DownloadForegroundService.hasAllFilesAccess(context),
@@ -281,6 +306,7 @@ fun MainScreen(viewModel: MainViewModel) {
             onRetryAlwaysChange = { viewModel.updateRetryAlways(it) },
             onRemoveAdsChange = { viewModel.updateRemoveAds(it) },
             onHlsParallelSegmentsChange = { viewModel.updateHlsParallelSegments(it) },
+            onMaxConcurrentTasksChange = { viewModel.updateMaxConcurrentTasks(it) },
             onDownloadLocationChange = { viewModel.updateDownloadLocation(it) },
             onOpenAllFilesAccess = openAllFilesAccess,
             onCheckYtDlpUpdates = { viewModel.checkYtDlpUpdates() },
@@ -841,7 +867,12 @@ private fun AddLinkDialog(
                     onValueChange = {
                         text = it
                     },
-                    label = { Text("输入 YouTube 视频/播放列表、HTTP/HTTPS 直链、magnet:? 或 .m3u8 链接") },
+                    label = {
+                        Text(
+                            if (youtubeEnabled) "输入 YouTube 视频/播放列表、HTTP/HTTPS 直链、magnet:? 或 .m3u8 链接"
+                            else "输入 HTTP/HTTPS 直链、magnet:? 或 .m3u8 链接"
+                        )
+                    },
                     singleLine = false,
                     maxLines = 4,
                     modifier = Modifier.fillMaxWidth()
@@ -898,15 +929,16 @@ private fun AddLinkDialog(
                             "清晰度和音频都选好后可直接启动；未选齐时先解析，再确认视频与字幕。",
                         style = MaterialTheme.typography.bodySmall
                     )
-                } else if (isYoutube) {
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text("Lite 版不支持 YouTube 下载，请使用 Full 版。", style = MaterialTheme.typography.bodySmall)
                 }
                 Spacer(modifier = Modifier.height(4.dp))
-                Text(
-                    "未选齐清晰度和音频时，YouTube 会先解析视频信息；播放列表需选择下载条目。同名文件不会覆盖已有文件。",
-                    style = MaterialTheme.typography.bodySmall
-                )
+                if (youtubeEnabled) {
+                    Text(
+                        "未选齐清晰度和音频时，YouTube 会先解析视频信息；播放列表需选择下载条目。同名文件不会覆盖已有文件。",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                } else {
+                    Text("同名文件不会覆盖已有文件。", style = MaterialTheme.typography.bodySmall)
+                }
             }
         },
         confirmButton = {
@@ -951,6 +983,9 @@ private fun SettingsDialog(
     retryAlways: Boolean,
     removeAds: Boolean,
     hlsParallelSegments: Int,
+    maxConcurrentTasks: Int,
+    ytDlpUpdateStatus: String?,
+    checkingYtDlpUpdate: Boolean,
     downloadDir: String,
     downloadLocation: String,
     hasAllFilesAccess: Boolean,
@@ -963,6 +998,7 @@ private fun SettingsDialog(
     onRetryAlwaysChange: (Boolean) -> Unit,
     onRemoveAdsChange: (Boolean) -> Unit,
     onHlsParallelSegmentsChange: (Int) -> Unit,
+    onMaxConcurrentTasksChange: (Int) -> Unit,
     onDownloadLocationChange: (String) -> Unit,
     onOpenAllFilesAccess: () -> Unit,
     onCheckYtDlpUpdates: () -> Unit,
@@ -1026,6 +1062,7 @@ private fun SettingsDialog(
         5L * 1024 * 1024 to "5 MB/s",
         10L * 1024 * 1024 to "10 MB/s"
     )
+    val concurrentTaskOptions = listOf(1, 2, 3, 4, 5, 8)
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("设置") },
@@ -1099,6 +1136,25 @@ private fun SettingsDialog(
                         "连接越多越快，但部分服务器会限制；新下载生效",
                         style = MaterialTheme.typography.bodySmall
                     )
+                }
+                Column {
+                    Text(
+                        "同时开始任务数：$maxConcurrentTasks",
+                        style = MaterialTheme.typography.titleSmall
+                    )
+                    Row(
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        concurrentTaskOptions.forEach { count ->
+                            FilterChip(
+                                selected = maxConcurrentTasks == count,
+                                onClick = { onMaxConcurrentTasksChange(count) },
+                                label = { Text(count.toString()) }
+                            )
+                        }
+                    }
+                    Text("超过数量的任务会排队等待", style = MaterialTheme.typography.bodySmall)
                 }
                 Column {
                     Text("全局限速", style = MaterialTheme.typography.titleSmall)
@@ -1318,8 +1374,15 @@ private fun SettingsDialog(
                             "更新检查为手动操作，只使用 Stable，不会自动切换到 Nightly。",
                             style = MaterialTheme.typography.bodySmall
                         )
-                        TextButton(onClick = onCheckYtDlpUpdates) {
-                            Text("检查 yt-dlp 更新（Stable）")
+                        TextButton(onClick = onCheckYtDlpUpdates, enabled = !checkingYtDlpUpdate) {
+                            if (checkingYtDlpUpdate) {
+                                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                                Spacer(modifier = Modifier.width(8.dp))
+                            }
+                            Text(if (checkingYtDlpUpdate) "正在检查…" else "检查 yt-dlp 更新（Stable）")
+                        }
+                        ytDlpUpdateStatus?.let {
+                            Text(it, style = MaterialTheme.typography.bodySmall)
                         }
                     }
                 }

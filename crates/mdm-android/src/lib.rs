@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::runtime::Runtime;
@@ -79,7 +79,12 @@ fn notify_all(tasks: &TaskMap, listener: &ListenerSlot) {
     }
 }
 
-fn update_task(tasks: &TaskMap, listener: &ListenerSlot, id: &str, f: impl FnOnce(&mut DownloadTask)) {
+fn update_task(
+    tasks: &TaskMap,
+    listener: &ListenerSlot,
+    id: &str,
+    f: impl FnOnce(&mut DownloadTask),
+) {
     let mut changed = false;
     if let Ok(mut map) = tasks.lock() {
         if let Some(task) = map.get_mut(id) {
@@ -98,6 +103,66 @@ fn fail_task(tasks: &TaskMap, listener: &ListenerSlot, id: &str, reason: String)
         t.error_message = Some(reason);
         t.speed_bytes_per_sec = 0;
     });
+}
+
+struct TaskSlot {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for TaskSlot {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+async fn acquire_task_slot(
+    tasks: &TaskMap,
+    listener: &ListenerSlot,
+    id: &str,
+    maximum: &AtomicUsize,
+    active: &Arc<AtomicUsize>,
+) -> Option<TaskSlot> {
+    loop {
+        let queued = tasks
+            .lock()
+            .ok()
+            .and_then(|map| map.get(id).map(|task| task.state == DownloadState::Queued))
+            .unwrap_or(false);
+        if !queued {
+            return None;
+        }
+        let limit = maximum.load(Ordering::SeqCst);
+        let current = active.load(Ordering::SeqCst);
+        if current < limit
+            && active
+                .compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            let started = tasks
+                .lock()
+                .ok()
+                .and_then(|mut map| {
+                    map.get_mut(id).map(|task| {
+                        if task.state == DownloadState::Queued {
+                            task.state = DownloadState::Downloading;
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                })
+                .unwrap_or(false);
+            if started {
+                notify_all(tasks, listener);
+                return Some(TaskSlot {
+                    active: Arc::clone(active),
+                });
+            }
+            active.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// Lazily start the shared BitTorrent session (or return the running one).
@@ -206,6 +271,8 @@ pub struct DownloadEngine {
     retry_settings: Arc<Mutex<RetrySettings>>,
     remove_ads: Arc<Mutex<bool>>,
     hls_parallel_segments: Arc<Mutex<u32>>,
+    max_concurrent_tasks: Arc<AtomicUsize>,
+    active_tasks: Arc<AtomicUsize>,
 }
 
 #[uniffi::export]
@@ -243,6 +310,8 @@ impl DownloadEngine {
             retry_settings: Arc::new(Mutex::new(RetrySettings::default())),
             remove_ads: Arc::new(Mutex::new(false)),
             hls_parallel_segments: Arc::new(Mutex::new(8)),
+            max_concurrent_tasks: Arc::new(AtomicUsize::new(3)),
+            active_tasks: Arc::new(AtomicUsize::new(0)),
         }))
     }
 
@@ -300,7 +369,13 @@ impl DownloadEngine {
     /// m3u8 出错自动重试设置：enabled 开关；max_attempts 重试次数，0 = 无限；
     /// delay_secs 每次重试前的等待秒数；always 为 false 时，还没下到任何字节
     /// 就失败的（链接失效、地址不对）不重试。正在下载的任务下次重试时生效。
-    pub fn set_retry_settings(&self, enabled: bool, max_attempts: u32, delay_secs: u64, always: bool) {
+    pub fn set_retry_settings(
+        &self,
+        enabled: bool,
+        max_attempts: u32,
+        delay_secs: u64,
+        always: bool,
+    ) {
         if let Ok(mut guard) = self.retry_settings.lock() {
             *guard = RetrySettings {
                 enabled,
@@ -327,6 +402,12 @@ impl DownloadEngine {
         }
     }
 
+    /// Maximum number of native downloads allowed to start at once; zero pauses admission.
+    pub fn set_max_concurrent_tasks(&self, value: u32) {
+        self.max_concurrent_tasks
+            .store(value.min(8) as usize, Ordering::SeqCst);
+    }
+
     pub fn add_http_download(
         &self,
         url: String,
@@ -341,7 +422,7 @@ impl DownloadEngine {
             other => {
                 return Err(MdmError::InvalidInput {
                     reason: format!("不支持的协议: {other}"),
-                })
+                });
             }
         }
 
@@ -364,10 +445,7 @@ impl DownloadEngine {
             .unwrap_or_else(|| resolved_name.clone());
 
         let conns = if connections == 0 {
-            self.default_connections
-                .lock()
-                .map(|g| *g)
-                .unwrap_or(8)
+            self.default_connections.lock().map(|g| *g).unwrap_or(8)
         } else {
             connections
         };
@@ -378,7 +456,7 @@ impl DownloadEngine {
             source_url: url.clone(),
             save_path: save_path.to_string_lossy().to_string(),
             kind: DownloadKind::Http,
-            state: DownloadState::Downloading,
+            state: DownloadState::Queued,
             total_bytes: 0,
             downloaded_bytes: 0,
             speed_bytes_per_sec: 0,
@@ -413,7 +491,7 @@ impl DownloadEngine {
             other => {
                 return Err(MdmError::InvalidInput {
                     reason: format!("不支持的协议: {other}"),
-                })
+                });
             }
         }
 
@@ -447,7 +525,7 @@ impl DownloadEngine {
             source_url: url.clone(),
             save_path: save_path.to_string_lossy().to_string(),
             kind: DownloadKind::Hls,
-            state: DownloadState::Downloading,
+            state: DownloadState::Queued,
             total_bytes: 0,
             downloaded_bytes: 0,
             speed_bytes_per_sec: 0,
@@ -463,12 +541,14 @@ impl DownloadEngine {
         Ok(id)
     }
 
-    pub fn add_magnet_download(&self, magnet_uri: String) -> Result<String, MdmError> {        let src = Source::magnet(&magnet_uri).ok_or_else(|| MdmError::InvalidInput {
+    pub fn add_magnet_download(&self, magnet_uri: String) -> Result<String, MdmError> {
+        let src = Source::magnet(&magnet_uri).ok_or_else(|| MdmError::InvalidInput {
             reason: "Magnet link must start with magnet:?".into(),
         })?;
 
         let id = Uuid::new_v4().to_string();
-        let display_name = extract_magnet_dn(&magnet_uri).unwrap_or_else(|| "Magnet Torrent".into());
+        let display_name =
+            extract_magnet_dn(&magnet_uri).unwrap_or_else(|| "Magnet Torrent".into());
         let save_path = self.download_dir.join(&display_name);
 
         let task = DownloadTask {
@@ -477,7 +557,7 @@ impl DownloadEngine {
             source_url: magnet_uri.clone(),
             save_path: save_path.to_string_lossy().to_string(),
             kind: DownloadKind::TorrentMagnet,
-            state: DownloadState::Downloading,
+            state: DownloadState::Queued,
             total_bytes: 0,
             downloaded_bytes: 0,
             speed_bytes_per_sec: 0,
@@ -512,7 +592,7 @@ impl DownloadEngine {
             source_url: torrent_path.clone(),
             save_path: self.download_dir.to_string_lossy().to_string(),
             kind: DownloadKind::TorrentFile,
-            state: DownloadState::Downloading,
+            state: DownloadState::Queued,
             total_bytes: 0,
             downloaded_bytes: 0,
             speed_bytes_per_sec: 0,
@@ -580,24 +660,26 @@ impl DownloadEngine {
 
         match task.kind {
             DownloadKind::Http => {
-                let parsed = url::Url::parse(&task.source_url).map_err(|_| MdmError::InvalidInput {
-                    reason: "无效的 URL".into(),
-                })?;
+                let parsed =
+                    url::Url::parse(&task.source_url).map_err(|_| MdmError::InvalidInput {
+                        reason: "无效的 URL".into(),
+                    })?;
                 let save_path = PathBuf::from(&task.save_path);
                 let conns = task.active_connections;
                 let shown = task.downloaded_bytes;
-                self.update_state(&id, DownloadState::Downloading)?;
+                self.update_state(&id, DownloadState::Queued)?;
                 self.run_http(id, parsed, save_path, conns, true, shown);
                 Ok(())
             }
             DownloadKind::Hls => {
-                let parsed = url::Url::parse(&task.source_url).map_err(|_| MdmError::InvalidInput {
-                    reason: "无效的 URL".into(),
-                })?;
+                let parsed =
+                    url::Url::parse(&task.source_url).map_err(|_| MdmError::InvalidInput {
+                        reason: "无效的 URL".into(),
+                    })?;
                 let save_path = PathBuf::from(&task.save_path);
                 // 分片下载支持断点续传：保留已下的部分和进度文件，
                 // 从上次断的地方继续（见 hls::progress_path）。
-                self.update_state(&id, DownloadState::Downloading)?;
+                self.update_state(&id, DownloadState::Queued)?;
                 self.run_hls(id, parsed, save_path);
                 Ok(())
             }
@@ -608,14 +690,9 @@ impl DownloadEngine {
                     .map(|map| map.get(&id).cloned())
                     .unwrap_or(None);
                 match hash_opt {
-                    Some(hash) => {
-                        let slot = Arc::clone(&self.torrents);
-                        let download_dir = self.download_dir.clone();
-                        self.runtime.spawn(async move {
-                            if let Ok(session) = get_torrent_session(&slot, &download_dir).await {
-                                let _ = session.resume(&hash).await;
-                            }
-                        });
+                    Some(_hash) => {
+                        self.update_state(&id, DownloadState::Queued)?;
+                        return Ok(());
                     }
                     None => {
                         // 重启后恢复的磁力/种子任务：会话里的哈希记录已丢，
@@ -630,16 +707,19 @@ impl DownloadEngine {
                             _ => None,
                         };
                         match src_opt {
-                            Some(src) => self.run_torrent(id.clone(), src),
+                            Some(src) => {
+                                self.update_state(&id, DownloadState::Queued)?;
+                                self.run_torrent(id, src);
+                                return Ok(());
+                            }
                             None => {
                                 return Err(MdmError::InvalidInput {
                                     reason: "无法恢复种子任务：链接无效".into(),
-                                })
+                                });
                             }
                         }
                     }
                 }
-                self.update_state(&id, DownloadState::Downloading)
             }
         }
     }
@@ -839,7 +919,20 @@ impl DownloadEngine {
         let tasks = Arc::clone(&self.tasks);
         let listener = Arc::clone(&self.listener);
         let handles = Arc::clone(&self.http_handles);
+        let max_concurrent_tasks = Arc::clone(&self.max_concurrent_tasks);
+        let active_tasks = Arc::clone(&self.active_tasks);
         self.runtime.spawn(async move {
+            let Some(_task_slot) = acquire_task_slot(
+                &tasks,
+                &listener,
+                &task_id,
+                &max_concurrent_tasks,
+                &active_tasks,
+            )
+            .await
+            else {
+                return;
+            };
             // 关键修复：Download::start / resume_or_start 内部用 tokio::spawn
             // 启动下载任务，必须在 tokio 运行时上下文里调用。在 UniFFI 的
             // JNI 线程上直接调用会 panic（"there is no reactor running"），
@@ -916,9 +1009,8 @@ impl DownloadEngine {
                     if let Some(state) = terminal {
                         t.state = state;
                         if state == DownloadState::Failed {
-                            t.error_message = error
-                                .clone()
-                                .or_else(|| Some("下载失败".to_string()));
+                            t.error_message =
+                                error.clone().or_else(|| Some("下载失败".to_string()));
                         }
                         if state == DownloadState::Completed {
                             t.speed_bytes_per_sec = 0;
@@ -952,11 +1044,27 @@ impl DownloadEngine {
         let retry_settings = Arc::clone(&self.retry_settings);
         let remove_ads = Arc::clone(&self.remove_ads);
         let hls_parallel_segments = Arc::clone(&self.hls_parallel_segments);
+        let max_concurrent_tasks = Arc::clone(&self.max_concurrent_tasks);
+        let active_tasks = Arc::clone(&self.active_tasks);
         let cancel = Arc::new(AtomicBool::new(false));
         if let Ok(mut map) = cancels.lock() {
             map.insert(task_id.clone(), Arc::clone(&cancel));
         }
         self.runtime.spawn(async move {
+            let Some(_task_slot) = acquire_task_slot(
+                &tasks,
+                &listener,
+                &task_id,
+                &max_concurrent_tasks,
+                &active_tasks,
+            )
+            .await
+            else {
+                if let Ok(mut map) = cancels.lock() {
+                    map.remove(&task_id);
+                }
+                return;
+            };
             // 复用上游的 TLS 配置：Android 上走纯 Rust WebPKI 校验
             //（rustls-platform-verifier 在这里永远初始化失败，见 #29）。
             let client = match mdm_engine::tls::configure(reqwest::Client::builder())
@@ -965,7 +1073,12 @@ impl DownloadEngine {
             {
                 Ok(c) => c,
                 Err(e) => {
-                    fail_task(&tasks, &listener, &task_id, format!("创建网络客户端失败: {e}"));
+                    fail_task(
+                        &tasks,
+                        &listener,
+                        &task_id,
+                        format!("创建网络客户端失败: {e}"),
+                    );
                     return;
                 }
             };
@@ -974,20 +1087,25 @@ impl DownloadEngine {
             // “始终重试”关着时，还没下到任何字节就失败的（链接失效、地址不对）不重试。
             // 去广告开关和并发数读一次，整次下载（包括重试）都用这个值。
             let remove_ads = remove_ads.lock().map(|g| *g).unwrap_or(false);
-            let parallel_segments = hls_parallel_segments
-                .lock()
-                .map(|g| *g)
-                .unwrap_or(8) as usize;
+            let parallel_segments = hls_parallel_segments.lock().map(|g| *g).unwrap_or(8) as usize;
             let mut attempt = 0u32;
             let result: Result<(), String> = loop {
                 attempt += 1;
-                let r = hls::download_hls(&client, url.as_str(), &save_path, &cancel, |downloaded, total, speed| {
-                    update_task(&tasks, &listener, &task_id, |t| {
-                        t.downloaded_bytes = downloaded;
-                        t.total_bytes = total;
-                        t.speed_bytes_per_sec = speed;
-                    });
-                }, remove_ads, parallel_segments)
+                let r = hls::download_hls(
+                    &client,
+                    url.as_str(),
+                    &save_path,
+                    &cancel,
+                    |downloaded, total, speed| {
+                        update_task(&tasks, &listener, &task_id, |t| {
+                            t.downloaded_bytes = downloaded;
+                            t.total_bytes = total;
+                            t.speed_bytes_per_sec = speed;
+                        });
+                    },
+                    remove_ads,
+                    parallel_segments,
+                )
                 .await;
                 if r.is_ok() {
                     break r;
@@ -996,10 +1114,7 @@ impl DownloadEngine {
                 if e == hls::ERR_CANCELLED {
                     break Err(e);
                 }
-                let rs = retry_settings
-                    .lock()
-                    .map(|g| *g)
-                    .unwrap_or_default();
+                let rs = retry_settings.lock().map(|g| *g).unwrap_or_default();
                 if !rs.enabled {
                     break Err(e);
                 }
@@ -1064,8 +1179,22 @@ impl DownloadEngine {
         let download_dir = self.download_dir.clone();
         let dl_limit = Arc::clone(&self.speed_limit_bps);
         let ul_limit = Arc::clone(&self.upload_limit_bps);
+        let max_concurrent_tasks = Arc::clone(&self.max_concurrent_tasks);
+        let active_tasks = Arc::clone(&self.active_tasks);
 
         self.runtime.spawn(async move {
+            let Some(task_slot) = acquire_task_slot(
+                &tasks,
+                &listener,
+                &task_id,
+                &max_concurrent_tasks,
+                &active_tasks,
+            )
+            .await
+            else {
+                return;
+            };
+            let mut task_slot = Some(task_slot);
             let session = match get_torrent_session(&slot, &download_dir).await {
                 Ok(s) => s,
                 Err(e) => {
@@ -1117,9 +1246,41 @@ impl DownloadEngine {
             if let Ok(mut map) = hashes.lock() {
                 map.insert(task_id.clone(), hash.clone());
             }
+            let paused_before_poll = tasks
+                .lock()
+                .ok()
+                .and_then(|map| map.get(&task_id).map(|task| task.state == DownloadState::Paused))
+                .unwrap_or(true);
+            if paused_before_poll {
+                let _ = session.pause(&hash).await;
+                drop(task_slot.take());
+            }
 
             let mut polls: u64 = 0;
             loop {
+                let state = tasks
+                    .lock()
+                    .ok()
+                    .and_then(|map| map.get(&task_id).map(|task| task.state));
+                let Some(state) = state else { break };
+                if state == DownloadState::Queued && task_slot.is_none() {
+                    let Some(next_slot) = acquire_task_slot(
+                        &tasks,
+                        &listener,
+                        &task_id,
+                        &max_concurrent_tasks,
+                        &active_tasks,
+                    )
+                    .await
+                    else {
+                        continue;
+                    };
+                    if let Err(error) = session.resume(&hash).await {
+                        fail_task(&tasks, &listener, &task_id, format!("恢复 BT 下载失败: {error}"));
+                        break;
+                    }
+                    task_slot = Some(next_slot);
+                }
                 match session.stats(&hash) {
                     Ok(stats) => {
                         polls += 1;
@@ -1149,7 +1310,9 @@ impl DownloadEngine {
                             t.upload_speed_bytes_per_sec = stats.up_speed as u64;
                             t.active_connections = stats.peers_live as u32;
                             if let Some(state) = terminal {
-                                t.state = state;
+                                if !(state == DownloadState::Paused && t.state == DownloadState::Queued) {
+                                    t.state = state;
+                                }
                                 if state == DownloadState::Failed {
                                     t.error_message =
                                         err.clone().or_else(|| Some("BT 下载失败".to_string()));
@@ -1159,6 +1322,9 @@ impl DownloadEngine {
                                 }
                             }
                         });
+                        if terminal == Some(DownloadState::Paused) {
+                            drop(task_slot.take());
+                        }
                         if matches!(terminal, Some(DownloadState::Completed | DownloadState::Failed))
                         {
                             break;

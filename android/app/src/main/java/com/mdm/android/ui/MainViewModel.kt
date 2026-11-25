@@ -48,9 +48,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         private set
     private var youtubeResolveJob: kotlinx.coroutines.Job? = null
     private var youtubeRequestedName: String? = null
+    var ytDlpUpdateStatus by mutableStateOf<String?>(null)
+        private set
+    var checkingYtDlpUpdate by mutableStateOf(false)
+        private set
 
     /** 每任务默认连接数（1-16），新下载生效。 */
     var maxConnections by mutableStateOf(prefs.getInt("max_connections", 8))
+        private set
+
+    /** 同时运行的下载任务总数（1-8），默认 3。 */
+    var maxConcurrentTasks by mutableIntStateOf(prefs.getInt("max_concurrent_tasks", 3).coerceIn(1, 8))
         private set
 
     /** 全局限速 bytes/s，0 = 不限速。 */
@@ -71,10 +79,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun checkYtDlpUpdates() {
         val ctx = getApplication<Application>()
-        val intent = Intent(ctx, DownloadForegroundService::class.java).apply {
-            action = DownloadForegroundService.ACTION_UPDATE_YTDLP
+        checkingYtDlpUpdate = true
+        ytDlpUpdateStatus = "正在使用 Stable 检查 yt-dlp 更新…"
+        runCatching {
+            val intent = Intent(ctx, DownloadForegroundService::class.java).apply {
+                action = DownloadForegroundService.ACTION_UPDATE_YTDLP
+            }
+            ContextCompat.startForegroundService(ctx, intent)
+        }.onFailure { error ->
+            checkingYtDlpUpdate = false
+            ytDlpUpdateStatus = "无法启动更新检查：${error.message ?: "未知错误"}"
         }
-        ContextCompat.startForegroundService(ctx, intent)
+    }
+
+    fun onYtDlpUpdateStatus(message: String) {
+        ytDlpUpdateStatus = message
+        checkingYtDlpUpdate = message.startsWith("正在") || message.contains("已在进行中")
     }
 
     fun updateMaxConnections(value: Int) {
@@ -82,6 +102,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         maxConnections = v
         prefs.edit().putInt("max_connections", v).apply()
         EngineRegistry.engine?.setDefaultConnections(v.toUInt())
+    }
+
+    fun updateMaxConcurrentTasks(value: Int) {
+        val v = value.coerceIn(1, 8)
+        maxConcurrentTasks = v
+        prefs.edit().putInt("max_concurrent_tasks", v).apply()
+        EngineRegistry.engine?.setMaxConcurrentTasks(v.toUInt())
+        val ctx = getApplication<Application>()
+        val intent = Intent(ctx, DownloadForegroundService::class.java).apply {
+            action = DownloadForegroundService.ACTION_UPDATE_CONCURRENCY
+        }
+        runCatching { ContextCompat.startForegroundService(ctx, intent) }
     }
 
     fun updateSpeedLimitBps(value: Long) {
@@ -188,7 +220,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (trimmed.isEmpty()) return
         if (isYouTubePageLink(trimmed)) {
             if (!YoutubeRuntime.youtubeEnabled) {
-                youtubeResolveState = YoutubeResolveUiState.Failed("Lite 版不支持 YouTube 下载，请使用 Full 版。")
+                youtubeResolveState = YoutubeResolveUiState.Failed("此版本不支持该链接类型。")
                 return
             }
             if (targetHeight != null && audioCeiling != null && !isYouTubePlaylistLink(trimmed)) {
@@ -230,7 +262,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         audioCeiling: Int? = null
     ) {
         if (!YoutubeRuntime.youtubeEnabled) {
-            youtubeResolveState = YoutubeResolveUiState.Failed("Lite 版不支持 YouTube 下载，请使用 Full 版。")
+            youtubeResolveState = YoutubeResolveUiState.Failed("此版本不支持该链接类型。")
             return
         }
         youtubeResolveJob?.cancel()

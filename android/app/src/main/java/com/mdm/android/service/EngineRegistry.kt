@@ -16,6 +16,20 @@ object EngineRegistry {
 
     private var nativeTasks: List<DownloadTask> = emptyList()
     private var youtubeTasks: List<DownloadTask> = emptyList()
+    private val createdAtById = mutableMapOf<String, Long>()
+
+    @Synchronized
+    fun restoreCreationTimes(times: Map<String, Long>) {
+        createdAtById.clear()
+        createdAtById.putAll(times)
+        publishCombined()
+    }
+
+    @Synchronized
+    fun noteTaskCreated(id: String, createdAt: Long = System.currentTimeMillis()) {
+        createdAtById[id] = createdAt
+        publishCombined()
+    }
 
     @Synchronized
     fun attach(instance: DownloadEngine) {
@@ -91,6 +105,9 @@ object EngineRegistry {
     }
 
     private fun publishCombined() {
-        _tasks.value = (nativeTasks + youtubeTasks).sortedByDescending { it.id }
+        _tasks.value = (nativeTasks + youtubeTasks).sortedWith(
+            compareByDescending<DownloadTask> { createdAtById[it.id] ?: 0L }
+                .thenByDescending { it.id }
+        )
     }
 }
