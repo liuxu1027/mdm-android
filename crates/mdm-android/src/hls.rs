@@ -111,6 +111,55 @@ fn seq_iv(seq: u64) -> [u8; 16] {
     iv
 }
 
+/// 从一段 TS 数据里读第一个视频 PES 包的 PTS（秒），读不到返回 None。
+/// 只认视频流（stream_id 0xE0–0xEF），不解析 PAT/PMT：逐个 188 字节包扫描，
+/// 找 PUSI=1 且以 00 00 01 开头的 PES 包，从 PES 头里取 PTS（90kHz）。
+/// 最多扫前 200 个包——分片开头一般就是关键帧，找不到就当读不到处理。
+fn first_video_pts(data: &[u8]) -> Option<f64> {
+    let mut off = 0usize;
+    let mut scanned = 0usize;
+    while off + 188 <= data.len() && scanned < 200 {
+        if data[off] != 0x47 {
+            off += 1;
+            continue;
+        }
+        scanned += 1;
+        let pusi = data[off + 1] & 0x40 != 0;
+        let adaptation = (data[off + 3] >> 4) & 0x03;
+        let mut payload_off = off + 4;
+        if adaptation == 2 || adaptation == 3 {
+            if payload_off >= data.len() {
+                break;
+            }
+            let afl = data[payload_off] as usize;
+            payload_off += 1 + afl;
+        }
+        if adaptation != 2
+            && pusi
+            && payload_off + 14 <= data.len()
+            && data[payload_off] == 0x00
+            && data[payload_off + 1] == 0x00
+            && data[payload_off + 2] == 0x01
+        {
+            let sid = data[payload_off + 3];
+            if (0xE0..=0xEF).contains(&sid) {
+                let pts_dts = (data[payload_off + 7] >> 6) & 0x03;
+                if pts_dts == 0b10 || pts_dts == 0b11 {
+                    let b = &data[payload_off + 9..payload_off + 14];
+                    let pts = (((b[0] as u64 >> 1) & 0x07) << 30)
+                        | ((b[1] as u64) << 22)
+                        | (((b[2] as u64 >> 1) & 0x7F) << 15)
+                        | ((b[3] as u64) << 7)
+                        | ((b[4] as u64 >> 1) & 0x7F);
+                    return Some(pts as f64 / 90000.0);
+                }
+            }
+        }
+        off += 188;
+    }
+    None
+}
+
 /// 有些站点的密钥地址返回的是 32 个十六进制字符（ppnix 就是）而不是原始 16 字节，
 /// 遇到就转成 16 字节；标准站点直接返回 16 字节的保持原样。
 fn normalize_key(b: Vec<u8>) -> Result<Vec<u8>, String> {
@@ -147,6 +196,69 @@ struct SegPlan {
     url: String,
     range: Option<(u64, u64)>,
     key: Option<(Vec<u8>, [u8; 16])>,
+}
+
+/// PTS 去广告（固定插入的广告）：广告段会把时间戳拉回 0 附近，主内容回来时
+/// 时间戳回到主时间线。用“基线 + 已保留分片总时长”算期望时间戳：掉下来超过
+/// 5 秒就是广告开始，回到 ±3 秒内就是广告结束。丢弃超过总时长 20% 就停掉
+/// 过滤（可能是正片本身多段拼接），后面全留。片头广告无法识别，不在处理范围。
+struct PtsAdFilter {
+    baseline: Option<f64>,
+    kept_secs: f64,
+    in_ad: bool,
+    discarded_secs: f64,
+    disabled: bool,
+    total_secs: f64,
+}
+
+impl PtsAdFilter {
+    /// 返回 true 表示保留该分片，false 表示丢弃（广告）。
+    /// pts 为 None（读不到时间戳）时直接保留，不做判断。
+    /// 基线只取本次运行的第一个分片：它读不到时间戳就没法建基线，本次不过滤。
+    fn classify(&mut self, pts: Option<f64>, duration: f64, is_first: bool) -> bool {
+        if self.disabled {
+            return true;
+        }
+        let Some(pts) = pts else {
+            return true;
+        };
+        if self.baseline.is_none() {
+            if !is_first {
+                self.disabled = true;
+                return true;
+            }
+            self.baseline = Some(pts);
+        }
+        let baseline = self.baseline.unwrap();
+        let expected = baseline + self.kept_secs;
+        if !self.in_ad && pts < expected - 5.0 {
+            self.in_ad = true;
+        } else if self.in_ad && (pts - expected).abs() <= 3.0 {
+            self.in_ad = false;
+        }
+        if self.in_ad {
+            if self.discarded_secs + duration > 0.20 * self.total_secs {
+                self.disabled = true;
+                self.in_ad = false;
+                log::info!("[HLS] PTS 去广告：丢弃已超总时长 20%，停止过滤，后面全留");
+                return true;
+            }
+            self.discarded_secs += duration;
+            log::info!(
+                "[HLS] PTS 去广告：跳过广告分片（PTS {:.1}，期望 {:.1}，时长 {:.1} 秒）",
+                pts,
+                expected,
+                duration
+            );
+            return false;
+        }
+        true
+    }
+
+    /// 该分片已保留进文件时调用，把它的时长计入已保留总时长。
+    fn note_kept(&mut self, duration: f64) {
+        self.kept_secs += duration;
+    }
 }
 
 /// 下载一个 m3u8 视频：拉播放列表 → 选清晰度 → 下分片（可解密）→ 合并成 .ts。
@@ -263,6 +375,15 @@ pub async fn download_hls(
         total_bytes
     );
 
+    // 每个分片之前的累计时长（cumulative[i] = 前 i 个分片的时长和），
+    // PTS 去广告续传时用它恢复“已保留分片总时长”。
+    let mut cumulative: Vec<f64> = Vec::with_capacity(media.segments.len() + 1);
+    cumulative.push(0.0);
+    for seg in media.segments.iter() {
+        let last = *cumulative.last().unwrap();
+        cumulative.push(last + seg.duration as f64);
+    }
+
     // 2. 算好每个分片的下载计划：地址、Range（无 offset 时接着上一个）、密钥只取一次。
     //    按 HLS 规矩，一个 #EXT-X-KEY 管它后面所有分片，直到出现新的 KEY 或 METHOD=NONE，
     //    所以要把密钥往后带：分片自己带了密钥就用它的并记住，没带就沿用记住的。
@@ -337,6 +458,10 @@ pub async fn download_hls(
     let progress_file = progress_path(out_path);
     let mut start_idx = 0usize;
     let mut downloaded: u64 = 0;
+    // PTS 去广告的续传状态：首个分片的时间戳基线、已丢弃的广告总时长。
+    // 旧进度文件没有这两行时按没有处理（续传时若缺基线，PTS 过滤会停掉）。
+    let mut baseline_pts: Option<f64> = None;
+    let mut discarded_secs: f64 = 0.0;
     if let Ok(txt) = std::fs::read_to_string(&progress_file) {
         let mut lines = txt.lines();
         let url_ok = lines.next() == Some(playlist_url);
@@ -346,6 +471,13 @@ pub async fn download_hls(
             == Some(plans.len());
         if url_ok && count_ok {
             if let Some(Ok(n)) = lines.next().map(|s| s.trim().parse::<usize>()) {
+                // 第 4、5 行（新版才有）：时间戳基线、已丢弃的广告总时长。
+                if let Some(b) = lines.next().and_then(|s| s.trim().parse::<f64>().ok()) {
+                    baseline_pts = Some(b);
+                }
+                if let Some(d) = lines.next().and_then(|s| s.trim().parse::<f64>().ok()) {
+                    discarded_secs = d;
+                }
                 if n >= plans.len() {
                     // 上次已全部写完，只差收尾：直接算完成。
                     let _ = std::fs::remove_file(&progress_file);
@@ -386,6 +518,22 @@ pub async fn download_hls(
     let started = Instant::now();
     let resume_base = downloaded; // 续传时已有字节不计入本次速度
 
+    // PTS 去广告的状态：基线（首个分片的时间戳）+ 已保留分片总时长。
+    // 续传时从进度文件恢复基线和已丢时长；旧进度文件没有基线时，
+    // 本次续传停掉 PTS 过滤（宁可留着广告也不错删正片）。
+    let mut pts_filter = PtsAdFilter {
+        baseline: baseline_pts,
+        kept_secs: if start_idx == 0 {
+            0.0
+        } else {
+            (cumulative[start_idx] - discarded_secs).max(0.0)
+        },
+        in_ad: false,
+        discarded_secs,
+        disabled: start_idx > 0 && baseline_pts.is_none(),
+        total_secs: total_duration as f64,
+    };
+
     // 流水线提速：parallel_segments 个连接一直满着，一个分片下完立刻上下一个，
     // 不用等整组都下完；先到的分片先缓存，按顺序写文件（.ts 必须按顺序拼）。
     // 原来是 8 个一组 join_all，一组里最慢的那个拖住整组，其他连接干等。
@@ -394,7 +542,7 @@ pub async fn download_hls(
     let mut set = tokio::task::JoinSet::new();
     let mut next_to_fetch = start_idx;
     let mut next_to_write = start_idx;
-    let mut buffered: HashMap<usize, Vec<u8>> = HashMap::new();
+    let mut buffered: HashMap<usize, (Vec<u8>, Option<f64>)> = HashMap::new();
     while next_to_write < plans.len() {
         // 有空位就补上下一个分片，保持 parallel_segments 个连接满着。
         while set.len() < parallel_segments && next_to_fetch < plans.len() {
@@ -405,29 +553,43 @@ pub async fn download_hls(
             let url = plan.url.clone();
             let range = plan.range;
             let key = plan.key.clone();
+            let want_pts = remove_ads;
             set.spawn(async move {
                 let mut data = fetch_bytes(&client, &url, range).await?;
                 if let Some((key_bytes, iv)) = key {
                     data = decrypt_aes128(&key_bytes, &iv, data)?;
                 }
-                Ok::<(usize, Vec<u8>), String>((idx, data))
+                let pts = if want_pts { first_video_pts(&data) } else { None };
+                Ok::<(usize, Vec<u8>, Option<f64>), String>((idx, data, pts))
             });
         }
         if is_cancelled(cancel) {
             return Err(ERR_CANCELLED.to_string());
         }
         match set.join_next().await {
-            Some(Ok(Ok((idx, data)))) => {
-                buffered.insert(idx, data);
+            Some(Ok(Ok((idx, data, pts)))) => {
+                buffered.insert(idx, (data, pts));
                 // 按顺序写出所有能写的分片。
-                while let Some(data) = buffered.remove(&next_to_write) {
+                while let Some((data, pts)) = buffered.remove(&next_to_write) {
                     if is_cancelled(cancel) {
                         return Err(ERR_CANCELLED.to_string());
                     }
-                    out.write_all(&data)
-                        .await
-                        .map_err(|e| format!("写入文件失败: {e}"))?;
-                    downloaded += data.len() as u64;
+                    // PTS 去广告（只在开了去广告时）：时间戳突然掉回 0 附近
+                    // 就是固定广告段，时间戳回到主时间线就是广告结束。
+                    // 读不到时间戳的分片直接保留，不做判断。
+                    let seg_duration = media.segments[next_to_write].duration as f64;
+                    let keep = if remove_ads {
+                        pts_filter.classify(pts, seg_duration, next_to_write == start_idx)
+                    } else {
+                        true
+                    };
+                    if keep {
+                        out.write_all(&data)
+                            .await
+                            .map_err(|e| format!("写入文件失败: {e}"))?;
+                        downloaded += data.len() as u64;
+                        pts_filter.note_kept(seg_duration);
+                    }
                     next_to_write += 1;
                     let elapsed = started.elapsed().as_secs_f64().max(0.1);
                     // 总大小：主播放列表给了码率时用“码率×总时长”；直接贴媒体列表
@@ -446,10 +608,21 @@ pub async fn download_hls(
                         ((downloaded - resume_base) as f64 / elapsed) as u64,
                     );
                     // 每写完 parallel_segments 个或全部写完时记一次进度：这次失败的话，下次从这里继续。
+                    // 进度文件共 5 行：地址、分片总数、已处理分片数、PTS 基线、已丢广告总时长。
                     if next_to_write % parallel_segments == 0 || next_to_write == plans.len() {
                         let _ = tokio::fs::write(
                             &progress_file,
-                            format!("{}\n{}\n{}", playlist_url, plans.len(), next_to_write),
+                            format!(
+                                "{}\n{}\n{}\n{}\n{}",
+                                playlist_url,
+                                plans.len(),
+                                next_to_write,
+                                pts_filter
+                                    .baseline
+                                    .map(|b| b.to_string())
+                                    .unwrap_or_default(),
+                                pts_filter.discarded_secs
+                            ),
                         )
                         .await;
                         log::info!(
