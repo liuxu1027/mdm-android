@@ -44,6 +44,10 @@ pub struct DownloadTask {
     pub speed_bytes_per_sec: u64,
     pub upload_speed_bytes_per_sec: u64,
     pub active_connections: u32,
+    /// HLS 已拉取的分片数 / 总分片数（其它类型恒为 0）：
+    /// 任务行用它显示“已拉取 X/Y 分片”。运行时数据，不进 TaskStore。
+    pub completed_segments: u32,
+    pub total_segments: u32,
     pub error_message: Option<String>,
 }
 
@@ -462,6 +466,8 @@ impl DownloadEngine {
             speed_bytes_per_sec: 0,
             upload_speed_bytes_per_sec: 0,
             active_connections: conns.clamp(1, 32),
+            completed_segments: 0,
+            total_segments: 0,
             error_message: None,
         };
 
@@ -531,6 +537,8 @@ impl DownloadEngine {
             speed_bytes_per_sec: 0,
             upload_speed_bytes_per_sec: 0,
             active_connections: 0,
+            completed_segments: 0,
+            total_segments: 0,
             error_message: None,
         };
 
@@ -563,6 +571,8 @@ impl DownloadEngine {
             speed_bytes_per_sec: 0,
             upload_speed_bytes_per_sec: 0,
             active_connections: 0,
+            completed_segments: 0,
+            total_segments: 0,
             error_message: None,
         };
 
@@ -598,6 +608,8 @@ impl DownloadEngine {
             speed_bytes_per_sec: 0,
             upload_speed_bytes_per_sec: 0,
             active_connections: 0,
+            completed_segments: 0,
+            total_segments: 0,
             error_message: None,
         };
 
@@ -884,6 +896,11 @@ impl DownloadEngine {
         if let Ok(mut map) = self.tasks.lock() {
             if let Some(task) = map.get_mut(id) {
                 task.state = state;
+                // 离开 Failed 状态时清掉旧的错误信息：之前这里只改 state，
+                // 全仓没有任何地方清 error_message，所以任务点了“继续”、
+                // 甚至后来下完了，行上还挂着上次失败的红字。
+                // 暂停时清掉也合理：已暂停的任务不应挂着旧错误。
+                task.error_message = None;
                 found = true;
             }
         }
@@ -1096,11 +1113,13 @@ impl DownloadEngine {
                     url.as_str(),
                     &save_path,
                     &cancel,
-                    |downloaded, total, speed| {
+                    |downloaded, total, speed, completed_segments, total_segments| {
                         update_task(&tasks, &listener, &task_id, |t| {
                             t.downloaded_bytes = downloaded;
                             t.total_bytes = total;
                             t.speed_bytes_per_sec = speed;
+                            t.completed_segments = completed_segments;
+                            t.total_segments = total_segments;
                         });
                     },
                     remove_ads,

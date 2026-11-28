@@ -87,6 +87,9 @@ class TaskStore(context: Context) :
                         speedBytesPerSec = 0u,
                         uploadSpeedBytesPerSec = 0u,
                         activeConnections = 0u,
+                        // 分片数是运行时数据，不进库：恢复时先 0，继续下载后由引擎再报。
+                        completedSegments = 0u,
+                        totalSegments = 0u,
                         errorMessage = it.getString(iErr)
                     )
                 )
@@ -108,8 +111,11 @@ class TaskStore(context: Context) :
      */
     fun saveThrottled(tasks: List<DownloadTask>) {
         DownloadTaskTiming.recordTaskStates(appContext, tasks)
+        // 签名里要带上所有“只变它自己、不变状态/标题/路径”的字段，
+        // 否则这类变化不会触发即时落盘，要等 2 秒进度节流才写。
+        // error_message：失败原因文本变了（比如失败后被清掉）也要立刻写库。
         val sig = tasks.sortedBy { it.id }
-            .joinToString("|") { "${it.id}:${it.state.name}:${it.title}:${it.savePath}" }
+            .joinToString("|") { "${it.id}:${it.state.name}:${it.title}:${it.savePath}:${it.errorMessage}" }
         val now = SystemClock.elapsedRealtime()
         if (sig != lastSignature) {
             lastSignature = sig
@@ -127,7 +133,7 @@ class TaskStore(context: Context) :
         DownloadTaskTiming.recordTaskStates(appContext, tasks)
         lastSavedAtMs = SystemClock.elapsedRealtime()
         lastSignature = tasks.sortedBy { it.id }
-            .joinToString("|") { "${it.id}:${it.state.name}:${it.title}:${it.savePath}" }
+            .joinToString("|") { "${it.id}:${it.state.name}:${it.title}:${it.savePath}:${it.errorMessage}" }
         saveAllInternal(tasks)
     }
 
