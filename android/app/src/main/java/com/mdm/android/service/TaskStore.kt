@@ -114,8 +114,9 @@ class TaskStore(context: Context) :
         // 签名里要带上所有“只变它自己、不变状态/标题/路径”的字段，
         // 否则这类变化不会触发即时落盘，要等 2 秒进度节流才写。
         // error_message：失败原因文本变了（比如失败后被清掉）也要立刻写库。
+        // source_url：“更新链接”只改地址，状态也变，但地址本身也要进签名。
         val sig = tasks.sortedBy { it.id }
-            .joinToString("|") { "${it.id}:${it.state.name}:${it.title}:${it.savePath}:${it.errorMessage}" }
+            .joinToString("|") { "${it.id}:${it.state.name}:${it.title}:${it.savePath}:${it.errorMessage}:${it.sourceUrl}" }
         val now = SystemClock.elapsedRealtime()
         if (sig != lastSignature) {
             lastSignature = sig
@@ -133,7 +134,7 @@ class TaskStore(context: Context) :
         DownloadTaskTiming.recordTaskStates(appContext, tasks)
         lastSavedAtMs = SystemClock.elapsedRealtime()
         lastSignature = tasks.sortedBy { it.id }
-            .joinToString("|") { "${it.id}:${it.state.name}:${it.title}:${it.savePath}:${it.errorMessage}" }
+            .joinToString("|") { "${it.id}:${it.state.name}:${it.title}:${it.savePath}:${it.errorMessage}:${it.sourceUrl}" }
         saveAllInternal(tasks)
     }
 

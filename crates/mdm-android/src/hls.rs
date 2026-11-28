@@ -22,6 +22,21 @@ use tokio::io::AsyncWriteExt;
 /// 取消时返回的错误文本，lib.rs 靠它把任务标成“已暂停”。
 pub const ERR_CANCELLED: &str = "下载已取消";
 
+/// 链接已过期（401/403/404/410）：按上游 wants_new_address() 的分类，
+/// 这组状态码就是“地址过期了，重试也没用，要个新地址”。
+/// fetch_bytes_once 遇到就直接返回这个，不再原样贴 HTTP 状态。
+pub const ERR_LINK_EXPIRED: &str = "链接已过期，请重新复制下载地址";
+
+/// 是不是链接过期错误（ERR_LINK_EXPIRED 本身）。
+pub fn is_link_expired_error(e: &str) -> bool {
+    e == ERR_LINK_EXPIRED
+}
+
+/// HTTP 状态码是不是“链接过期”那组（401/403/404/410）。
+fn is_expired_status(status: u16) -> bool {
+    matches!(status, 401 | 403 | 404 | 410)
+}
+
 /// 断点续传进度文件：放在输出文件旁边，内容是三行：
 /// 播放列表地址、分片总数、已写完的分片数。
 /// 任务失败或取消时保留，下次继续时从这里接着下；
@@ -47,6 +62,10 @@ async fn fetch_bytes(
             Ok(b) => return Ok(b),
             Err(e) => {
                 last_err = e;
+                // 链接过期了重试也没用（新地址才行），不等退避直接返回。
+                if is_link_expired_error(&last_err) {
+                    return Err(last_err);
+                }
                 if attempt < 5 {
                     let wait = 1u64 << (attempt - 1); // 1、2、4、8 秒
                     log::warn!("[HLS] 请求失败，第 {attempt}/5 次重试 {url}: {last_err}（{wait} 秒后）");
@@ -72,6 +91,11 @@ async fn fetch_bytes_once(
         .await
         .map_err(|e| format!("请求失败 {url}: {e}"))?;
     let status = resp.status();
+    // 先判过期：401/403/404/410 就是地址过期了（上游 wants_new_address 的分类），
+    // 直接报过期，不再贴 HTTP 状态，也不在外层重试。
+    if is_expired_status(status.as_u16()) {
+        return Err(ERR_LINK_EXPIRED.to_string());
+    }
     if range.is_some() && status.as_u16() != 206 {
         return Err(format!("请求失败 {url}: 服务器不支持 Range 请求（HTTP {status}）"));
     }

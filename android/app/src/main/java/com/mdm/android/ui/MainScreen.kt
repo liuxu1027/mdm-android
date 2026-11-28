@@ -99,6 +99,9 @@ fun MainScreen(viewModel: MainViewModel) {
     var renamingTaskId by remember { mutableStateOf<String?>(null) }
     var renameValue by remember { mutableStateOf("") }
     var renameError by remember { mutableStateOf<String?>(null) }
+    var updateLinkTaskId by remember { mutableStateOf<String?>(null) }
+    var updateLinkValue by remember { mutableStateOf("") }
+    var updateLinkError by remember { mutableStateOf<String?>(null) }
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
     val youtubeResolveState = viewModel.youtubeResolveState
@@ -516,6 +519,17 @@ fun MainScreen(viewModel: MainViewModel) {
                         modifier = Modifier.fillMaxWidth()
                     ) { Text("重新下载", modifier = Modifier.fillMaxWidth()) }
                     TextButton(
+                        enabled = (selectedTask.kind == DownloadKind.HTTP || selectedTask.kind == DownloadKind.HLS) &&
+                            (selectedTask.state == DownloadState.PAUSED || selectedTask.state == DownloadState.FAILED),
+                        onClick = {
+                            updateLinkTaskId = selectedTask.id
+                            updateLinkValue = selectedTask.sourceUrl
+                            updateLinkError = null
+                            selectedTaskId = null
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("更新链接", modifier = Modifier.fillMaxWidth()) }
+                    TextButton(
                         onClick = {
                             selectedTaskId = null
                             if (selectedTask.kind == DownloadKind.YOUTUBE) viewModel.retryOptions(selectedTask)
@@ -624,6 +638,55 @@ fun MainScreen(viewModel: MainViewModel) {
                 }
             },
             confirmButton = { TextButton(onClick = { propertiesTaskId = null }) { Text("关闭") } }
+        )
+    }
+
+    val updateLinkTask = tasks.firstOrNull { it.id == updateLinkTaskId }
+    if (updateLinkTask != null) {
+        AlertDialog(
+            onDismissRequest = { updateLinkTaskId = null },
+            title = { Text("更新链接") },
+            text = {
+                Column {
+                    OutlinedTextField(
+                        value = updateLinkValue,
+                        onValueChange = { updateLinkValue = it },
+                        label = { Text("新的下载地址") },
+                        singleLine = false,
+                        maxLines = 4,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        "只换地址，不动已下文件。保存后任务回到“已暂停”，点“继续”按新地址接着下；" +
+                            "HTTP 新链接的文件和原来不一致时会从头开始下载；HLS 换链接后从头下载。",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    if (updateLinkError != null) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            updateLinkError!!,
+                            color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val error = viewModel.updateTaskUrl(updateLinkTask.id, updateLinkValue)
+                        .exceptionOrNull()?.message
+                    if (error == null) {
+                        updateLinkTaskId = null
+                        Toast.makeText(context, "链接已更新，点“继续”接着下载", Toast.LENGTH_LONG).show()
+                    } else {
+                        updateLinkError = error
+                    }
+                }) { Text("保存") }
+            },
+            dismissButton = {
+                TextButton(onClick = { updateLinkTaskId = null }) { Text("取消") }
+            }
         )
     }
 

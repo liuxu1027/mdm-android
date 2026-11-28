@@ -109,6 +109,24 @@ fn fail_task(tasks: &TaskMap, listener: &ListenerSlot, id: &str, reason: String)
     });
 }
 
+/// 上游把 401/403/404/410 报成 "server answered 403 Forbidden" 之类的文本；
+/// 这组状态码按上游 wants_new_address() 的分类就是“地址过期了，重试也没用，
+/// 要个新地址”。直接显示成过期提示，而不是原样贴 HTTP 状态。
+/// HLS 的过期错误已经是这句提示了，原样返回。
+fn expired_link_message(reason: &str) -> String {
+    if reason == hls::ERR_LINK_EXPIRED {
+        return reason.to_string();
+    }
+    for code in ["401", "403", "404", "410"] {
+        if reason.contains(&format!("server answered {code}"))
+            || reason.contains(&format!("HTTP {code}"))
+        {
+            return hls::ERR_LINK_EXPIRED.to_string();
+        }
+    }
+    reason.to_string()
+}
+
 struct TaskSlot {
     active: Arc<AtomicUsize>,
 }
@@ -1014,6 +1032,59 @@ impl DownloadEngine {
         Ok(())
     }
 
+    /// 换下载地址（链接过期时用）：只改 source_url，保留任务 id、已下文件和
+    /// HTTP state / HLS 进度文件，改完回到“已暂停”，由用户点“继续”走断点续传。
+    /// 注意：HTTP 换链接后能否续传取决于新链接的文件和旧 state 是否一致，
+    /// 不一致时上游会从头下；HLS 进度文件按地址校验，换地址后从头下。
+    /// 只允许已暂停/失败的 HTTP/HLS 任务换地址（下载中换地址没有意义，
+    /// 磁力/种子任务没有“过期链接”这回事）。
+    pub fn update_task_source_url(&self, id: String, new_url: String) -> Result<(), MdmError> {
+        let parsed = url::Url::parse(&new_url).map_err(|_| MdmError::InvalidInput {
+            reason: "无效的 URL".into(),
+        })?;
+        let mut tasks = self.tasks.lock().map_err(|_| MdmError::Engine {
+            reason: "任务列表暂不可用".into(),
+        })?;
+        let task = tasks
+            .get_mut(&id)
+            .ok_or_else(|| MdmError::NotFound { id: id.clone() })?;
+        if !matches!(task.state, DownloadState::Paused | DownloadState::Failed) {
+            return Err(MdmError::Engine {
+                reason: "请先暂停下载，再更新链接".into(),
+            });
+        }
+        match task.kind {
+            DownloadKind::Http => match parsed.scheme() {
+                "http" | "https" | "ftp" => {}
+                other => {
+                    return Err(MdmError::InvalidInput {
+                        reason: format!("不支持的协议: {other}"),
+                    });
+                }
+            },
+            DownloadKind::Hls => match parsed.scheme() {
+                "http" | "https" => {}
+                other => {
+                    return Err(MdmError::InvalidInput {
+                        reason: format!("不支持的协议: {other}"),
+                    });
+                }
+            },
+            _ => {
+                return Err(MdmError::Engine {
+                    reason: "磁力/种子任务不支持更新链接".into(),
+                });
+            }
+        }
+        task.source_url = new_url;
+        // 旧地址的错误已经没意义了，清掉；状态回到已暂停，等用户点“继续”。
+        task.error_message = None;
+        task.state = DownloadState::Paused;
+        drop(tasks);
+        notify_all(&self.tasks, &self.listener);
+        Ok(())
+    }
+
     pub fn list_tasks(&self) -> Vec<DownloadTask> {
         self.tasks
             .lock()
@@ -1235,8 +1306,12 @@ impl DownloadEngine {
                     if let Some(state) = terminal {
                         t.state = state;
                         if state == DownloadState::Failed {
-                            t.error_message =
-                                error.clone().or_else(|| Some("下载失败".to_string()));
+                            t.error_message = Some(
+                                error
+                                    .clone()
+                                    .map(|e| expired_link_message(&e))
+                                    .unwrap_or_else(|| "下载失败".to_string()),
+                            );
                         }
                         if state == DownloadState::Completed {
                             t.speed_bytes_per_sec = 0;
@@ -1339,7 +1414,8 @@ impl DownloadEngine {
                     break r;
                 }
                 let e = r.unwrap_err();
-                if e == hls::ERR_CANCELLED {
+                if e == hls::ERR_CANCELLED || hls::is_link_expired_error(&e) {
+                    // 取消和链接过期都不重试：过期链接换地址才行，一直重试没用。
                     break Err(e);
                 }
                 let rs = retry_settings.lock().map(|g| *g).unwrap_or_default();
@@ -1389,7 +1465,7 @@ impl DownloadEngine {
                     });
                 }
                 Err(e) => {
-                    fail_task(&tasks, &listener, &task_id, e);
+                    fail_task(&tasks, &listener, &task_id, expired_link_message(&e));
                 }
             }
             if let Ok(mut map) = cancels.lock() {

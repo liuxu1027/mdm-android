@@ -496,6 +496,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         ContextCompat.startForegroundService(ctx, intent)
     }
 
+    fun updateTaskUrl(id: String, newUrl: String): Result<Unit> = runCatching {
+        val engine = EngineRegistry.engine ?: error("下载引擎尚未启动")
+        engine.updateTaskSourceUrl(id, newUrl.trim())
+    }
+
     fun rename(id: String, newTitle: String): Result<Unit> = runCatching {
         require(newTitle.isNotBlank()) { "文件名不能为空" }
         val task = tasks.value.firstOrNull { it.id == id } ?: error("找不到下载任务")
