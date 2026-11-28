@@ -44,6 +44,7 @@ class TaskStore(context: Context) :
                 "total_bytes INTEGER NOT NULL, " +
                 "downloaded_bytes INTEGER NOT NULL, " +
                 "error_message TEXT, " +
+                "selected_files TEXT, " +
                 "created_at INTEGER NOT NULL DEFAULT 0)"
         )
     }
@@ -51,6 +52,9 @@ class TaskStore(context: Context) :
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
         if (oldVersion < 2) {
             db.execSQL("ALTER TABLE $TABLE ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0")
+        }
+        if (oldVersion < 3) {
+            db.execSQL("ALTER TABLE $TABLE ADD COLUMN selected_files TEXT")
         }
     }
 
@@ -69,11 +73,17 @@ class TaskStore(context: Context) :
             val iTotal = it.getColumnIndexOrThrow("total_bytes")
             val iDone = it.getColumnIndexOrThrow("downloaded_bytes")
             val iErr = it.getColumnIndexOrThrow("error_message")
+            val iSelected = it.getColumnIndexOrThrow("selected_files")
             val iCreatedAt = it.getColumnIndexOrThrow("created_at")
             while (it.moveToNext()) {
                 createdAtById[it.getString(iId)] = it.getLong(iCreatedAt)
                 val kind = kindFromString(it.getString(iKind)) ?: continue
                 val state = stateFromString(it.getString(iState))
+                // 选中文件索引逗号分隔存着；空或缺失 = 全下（老库行没有这列值）。
+                val selectedFiles = it.getString(iSelected)
+                    ?.split(",")
+                    ?.mapNotNull { s -> s.trim().toUIntOrNull() }
+                    ?.takeIf { list -> list.isNotEmpty() }
                 out.add(
                     DownloadTask(
                         id = it.getString(iId),
@@ -90,6 +100,7 @@ class TaskStore(context: Context) :
                         // 分片数是运行时数据，不进库：恢复时先 0，继续下载后由引擎再报。
                         completedSegments = 0u,
                         totalSegments = 0u,
+                        selectedFiles = selectedFiles,
                         errorMessage = it.getString(iErr)
                     )
                 )
@@ -115,8 +126,9 @@ class TaskStore(context: Context) :
         // 否则这类变化不会触发即时落盘，要等 2 秒进度节流才写。
         // error_message：失败原因文本变了（比如失败后被清掉）也要立刻写库。
         // source_url：“更新链接”只改地址，状态也变，但地址本身也要进签名。
+        // selectedFiles：磁力选中列表变了也要立刻写库（虽然一般是建任务时就定好）。
         val sig = tasks.sortedBy { it.id }
-            .joinToString("|") { "${it.id}:${it.state.name}:${it.title}:${it.savePath}:${it.errorMessage}:${it.sourceUrl}" }
+            .joinToString("|") { "${it.id}:${it.state.name}:${it.title}:${it.savePath}:${it.errorMessage}:${it.sourceUrl}:${it.selectedFiles?.joinToString(",").orEmpty()}" }
         val now = SystemClock.elapsedRealtime()
         if (sig != lastSignature) {
             lastSignature = sig
@@ -134,7 +146,7 @@ class TaskStore(context: Context) :
         DownloadTaskTiming.recordTaskStates(appContext, tasks)
         lastSavedAtMs = SystemClock.elapsedRealtime()
         lastSignature = tasks.sortedBy { it.id }
-            .joinToString("|") { "${it.id}:${it.state.name}:${it.title}:${it.savePath}:${it.errorMessage}:${it.sourceUrl}" }
+            .joinToString("|") { "${it.id}:${it.state.name}:${it.title}:${it.savePath}:${it.errorMessage}:${it.sourceUrl}:${it.selectedFiles?.joinToString(",").orEmpty()}" }
         saveAllInternal(tasks)
     }
 
@@ -154,6 +166,7 @@ class TaskStore(context: Context) :
                         put("total_bytes", t.totalBytes.toLong())
                         put("downloaded_bytes", t.downloadedBytes.toLong())
                         put("error_message", t.errorMessage)
+                        put("selected_files", t.selectedFiles?.joinToString(",") { it.toString() })
                         put("created_at", createdAtById.computeIfAbsent(t.id) { System.currentTimeMillis() })
                     }
                     db.insertWithOnConflict(TABLE, null, v, SQLiteDatabase.CONFLICT_REPLACE)
@@ -185,7 +198,7 @@ class TaskStore(context: Context) :
 
     companion object {
         private const val DB_NAME = "mdm_tasks.db"
-        private const val DB_VERSION = 2
+        private const val DB_VERSION = 3
         private const val TABLE = "tasks"
         private const val PROGRESS_SAVE_INTERVAL_MS = 2000L
     }

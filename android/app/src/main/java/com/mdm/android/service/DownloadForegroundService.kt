@@ -98,7 +98,12 @@ class DownloadForegroundService : Service(), ProgressListener {
             ACTION_ADD_MAGNET -> {
                 val magnet = intent.getStringExtra(EXTRA_URL)
                 if (!magnet.isNullOrBlank()) {
-                    runCatching { engine?.addMagnetDownload(magnet) }.getOrNull()?.let(::noteTaskCreated)
+                    // 带选中文件索引时走多文件选择那路；没带就是全下。
+                    val files = intent.getIntegerArrayListExtra(EXTRA_MAGNET_FILES)
+                    runCatching {
+                        if (!files.isNullOrEmpty()) engine?.addMagnetDownloadWithFiles(magnet, files.map { it.toUInt() })
+                        else engine?.addMagnetDownload(magnet)
+                    }.getOrNull()?.let(::noteTaskCreated)
                 }
             }
             ACTION_ADD_HLS -> {
@@ -361,6 +366,7 @@ class DownloadForegroundService : Service(), ProgressListener {
         const val EXTRA_YOUTUBE_SUBTITLES = "extra_youtube_subtitles"
         const val EXTRA_YOUTUBE_AUDIO_ONLY = "extra_youtube_audio_only"
         const val EXTRA_YTDLP_STATUS = "extra_ytdlp_status"
+        const val EXTRA_MAGNET_FILES = "extra_magnet_files"
 
         /** 是否有“所有文件访问权限”（Android 11+）。 */
         fun hasAllFilesAccess(context: Context): Boolean =

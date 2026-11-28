@@ -48,7 +48,27 @@ pub struct DownloadTask {
     /// 任务行用它显示“已拉取 X/Y 分片”。运行时数据，不进 TaskStore。
     pub completed_segments: u32,
     pub total_segments: u32,
+    /// 磁力/种子任务选中的文件索引（None = 全下）：重启、续传、重新下载时带上，
+    /// 否则重启后继续会变全下。HTTP/HLS/YouTube 恒为 None。
+    pub selected_files: Option<Vec<u32>>,
     pub error_message: Option<String>,
+}
+
+/// 磁力/种子里的一个文件：index 是它在 Meta.files 里的原始下标。
+/// 填充文件（BEP 47 padding）不显示也不参与选择，但下标不重排，
+/// 这样选中的索引直接传给 session.add 不会错位。
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MagnetFileInfo {
+    pub index: u32,
+    pub name: String,
+    pub size: u64,
+}
+
+/// 磁力/种子元数据：拿文件列表给选择对话框用。
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MagnetMetadata {
+    pub name: String,
+    pub files: Vec<MagnetFileInfo>,
 }
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -604,6 +624,7 @@ impl DownloadEngine {
             active_connections: conns.clamp(1, 32),
             completed_segments: 0,
             total_segments: 0,
+            selected_files: None,
             error_message: None,
         };
 
@@ -675,6 +696,7 @@ impl DownloadEngine {
             active_connections: 0,
             completed_segments: 0,
             total_segments: 0,
+            selected_files: None,
             error_message: None,
         };
 
@@ -685,7 +707,56 @@ impl DownloadEngine {
         Ok(id)
     }
 
+    /// 取磁力元数据（文件列表）：只拿列表不开始下载，给文件选择对话框用。
+    /// 120 秒内拿不到（无 peer、DHT 慢）就报错，调用方回退到“全下”，不要卡住。
+    /// 注意是同步阻塞调用（里面用了 block_on），只在 Kotlin 的 IO 线程上调，
+    /// 不要在运行时 worker 线程上调。
+    pub fn fetch_magnet_metadata(&self, magnet_uri: String) -> Result<MagnetMetadata, MdmError> {
+        let src = Source::magnet(&magnet_uri).ok_or_else(|| MdmError::InvalidInput {
+            reason: "Magnet link must start with magnet:?".into(),
+        })?;
+        let slot = Arc::clone(&self.torrents);
+        let download_dir = self.download_dir.clone();
+        let tasks = Arc::clone(&self.tasks);
+        let hashes = Arc::clone(&self.torrent_hashes);
+        self.runtime.block_on(async move {
+            let session = get_torrent_session(&slot, &download_dir, &tasks, &hashes)
+                .await
+                .map_err(|e| MdmError::Engine { reason: e })?;
+            let meta = session
+                .metadata(&src, Duration::from_secs(120), None)
+                .await
+                .map_err(|e| MdmError::Engine {
+                    reason: format!("获取种子信息失败: {e}"),
+                })?;
+            Ok(MagnetMetadata {
+                name: meta.name.clone(),
+                files: meta
+                    .files
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, f)| !f.padding)
+                    .map(|(i, f)| MagnetFileInfo {
+                        index: i as u32,
+                        name: f.path.to_string_lossy().to_string(),
+                        size: f.size,
+                    })
+                    .collect(),
+            })
+        })
+    }
+
     pub fn add_magnet_download(&self, magnet_uri: String) -> Result<String, MdmError> {
+        self.add_magnet_download_with_files(magnet_uri, vec![])
+    }
+
+    /// 加磁力下载（带选中文件索引）：files 为空 = 全下。
+    /// 选中列表存在任务里，重启、续传、重新下载时带上，否则会变全下。
+    pub fn add_magnet_download_with_files(
+        &self,
+        magnet_uri: String,
+        files: Vec<u32>,
+    ) -> Result<String, MdmError> {
         let src = Source::magnet(&magnet_uri).ok_or_else(|| MdmError::InvalidInput {
             reason: "Magnet link must start with magnet:?".into(),
         })?;
@@ -694,6 +765,8 @@ impl DownloadEngine {
         let display_name =
             extract_magnet_dn(&magnet_uri).unwrap_or_else(|| "Magnet Torrent".into());
         let save_path = self.download_dir.join(&display_name);
+        let selected_files: Option<Vec<u32>> =
+            if files.is_empty() { None } else { Some(files) };
 
         let task = DownloadTask {
             id: id.clone(),
@@ -709,12 +782,13 @@ impl DownloadEngine {
             active_connections: 0,
             completed_segments: 0,
             total_segments: 0,
+            selected_files: selected_files.clone(),
             error_message: None,
         };
 
         self.insert_task(task);
         log::info!("[BT] 添加磁力任务: {}", display_name);
-        self.run_torrent(id.clone(), src);
+        self.run_torrent(id.clone(), src, selected_files);
 
         Ok(id)
     }
@@ -746,11 +820,12 @@ impl DownloadEngine {
             active_connections: 0,
             completed_segments: 0,
             total_segments: 0,
+            selected_files: None,
             error_message: None,
         };
 
         self.insert_task(task);
-        self.run_torrent(id.clone(), Source::File(bytes));
+        self.run_torrent(id.clone(), Source::File(bytes), None);
 
         Ok(id)
     }
@@ -866,8 +941,10 @@ impl DownloadEngine {
                 };
                 match src_opt {
                     Some(src) => {
+                        // 重新加入会话时带上原来的选中文件，否则重启后继续会变全下。
+                        let selected_files = task.selected_files.clone();
                         self.update_state(&id, DownloadState::Queued)?;
-                        self.run_torrent(id, src);
+                        self.run_torrent(id, src, selected_files);
                         return Ok(());
                     }
                     None => {
@@ -1475,7 +1552,7 @@ impl DownloadEngine {
     }
 
     /// Fetch a magnet's metadata, add it to the BT session, and poll its stats.
-    fn run_torrent(&self, task_id: String, src: Source) {
+    fn run_torrent(&self, task_id: String, src: Source, files: Option<Vec<u32>>) {
         let tasks = Arc::clone(&self.tasks);
         let listener = Arc::clone(&self.listener);
         let hashes = Arc::clone(&self.torrent_hashes);
@@ -1486,6 +1563,9 @@ impl DownloadEngine {
         let ul_limit = Arc::clone(&self.upload_limit_bps);
         let max_concurrent_tasks = Arc::clone(&self.max_concurrent_tasks);
         let active_tasks = Arc::clone(&self.active_tasks);
+        // 选中文件索引转成 librqbit 要的 usize（None = 全下）。
+        let files_usize: Option<Vec<usize>> =
+            files.map(|v| v.into_iter().map(|i| i as usize).collect());
 
         self.runtime.spawn(async move {
             // 轮询循环存活标记：resume_task 靠它判断“有没有循环在跑、能接住 Queued”。
@@ -1545,7 +1625,7 @@ impl DownloadEngine {
             });
 
             let hash = match session
-                .add(&meta.torrent, &download_dir, None, vec![], false)
+                .add(&meta.torrent, &download_dir, files_usize, vec![], false)
                 .await
             {
                 Ok(h) => h,

@@ -27,6 +27,7 @@ import kotlinx.coroutines.withContext
 import uniffi.mdm_android.DownloadKind
 import uniffi.mdm_android.DownloadState
 import uniffi.mdm_android.DownloadTask
+import uniffi.mdm_android.MagnetMetadata
 import java.io.File
 import java.io.IOException
 import java.net.HttpURLConnection
@@ -41,6 +42,12 @@ sealed class YoutubeResolveUiState {
         val initialAudioCeiling: Int? = null
     ) : YoutubeResolveUiState()
     data class Failed(val message: String) : YoutubeResolveUiState()
+}
+
+/** 磁力文件选择：粘贴磁力后先拿文件列表，再让用户勾选。 */
+sealed class MagnetPickerUiState {
+    object Loading : MagnetPickerUiState()
+    data class Ready(val magnet: String, val metadata: MagnetMetadata) : MagnetPickerUiState()
 }
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -58,6 +65,66 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         private set
     private var youtubeResolveJob: kotlinx.coroutines.Job? = null
     private var youtubeRequestedName: String? = null
+
+    var magnetPickerState by mutableStateOf<MagnetPickerUiState?>(null)
+        private set
+    private var magnetPickerJob: kotlinx.coroutines.Job? = null
+
+    /**
+     * 磁力文件选择：先调一次 metadata（120 秒超时）拿文件列表。
+     * 单文件直接跳过选择全下；120 秒内拿不到元数据也回退到全下，不卡住。
+     */
+    fun startMagnetPicker(magnet: String) {
+        magnetPickerJob?.cancel()
+        magnetPickerState = MagnetPickerUiState.Loading
+        magnetPickerJob = viewModelScope.launch {
+            try {
+                val metadata = withContext(Dispatchers.IO) {
+                    val engine = EngineRegistry.engine ?: error("下载引擎尚未启动")
+                    engine.fetchMagnetMetadata(magnet.trim())
+                }
+                if (metadata.files.size <= 1) {
+                    magnetPickerState = null
+                    addMagnetDownload(magnet, null)
+                } else {
+                    magnetPickerState = MagnetPickerUiState.Ready(magnet.trim(), metadata)
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                magnetPickerState = null
+                addMagnetDownload(magnet, null)
+                batchMessage = "拿不到文件列表，直接下载全部文件"
+            }
+        }
+    }
+
+    fun dismissMagnetPicker() {
+        magnetPickerJob?.cancel()
+        magnetPickerJob = null
+        magnetPickerState = null
+    }
+
+    /** 文件选择对话框里点“开始下载”：带选中索引进下载。 */
+    fun confirmMagnetDownload(magnet: String, files: List<UInt>) {
+        magnetPickerState = null
+        addMagnetDownload(magnet, files)
+    }
+
+    private fun addMagnetDownload(magnet: String, files: List<UInt>?) {
+        val ctx = getApplication<Application>()
+        val intent = Intent(ctx, DownloadForegroundService::class.java).apply {
+            action = DownloadForegroundService.ACTION_ADD_MAGNET
+            putExtra(DownloadForegroundService.EXTRA_URL, magnet.trim())
+            if (!files.isNullOrEmpty()) {
+                putIntegerArrayListExtra(
+                    DownloadForegroundService.EXTRA_MAGNET_FILES,
+                    ArrayList(files.map { it.toInt() })
+                )
+            }
+        }
+        ContextCompat.startForegroundService(ctx, intent)
+    }
     var ytDlpUpdateStatus by mutableStateOf<String?>(null)
         private set
     var checkingYtDlpUpdate by mutableStateOf(false)
@@ -226,14 +293,26 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         prefs.edit().putString("download_location", v).apply()
     }
 
+    /**
+     * pickMagnetFiles=true 时，单条磁力先弹文件选择（多文件才弹，单文件直接下）；
+     * 多行粘贴和重新下载传 false，不弹选择框。
+     * magnetFiles 不为空时按它下（重新下载带上原来选的文件，不弹框也不变全下）。
+     */
     fun addLink(
         rawInput: String,
         filename: String? = null,
         targetHeight: Int? = null,
-        audioCeiling: Int? = null
+        audioCeiling: Int? = null,
+        pickMagnetFiles: Boolean = true,
+        magnetFiles: List<UInt>? = null
     ) {
         val trimmed = rawInput.trim()
         if (trimmed.isEmpty()) return
+        if (trimmed.startsWith("magnet:?")) {
+            if (pickMagnetFiles) startMagnetPicker(trimmed)
+            else addMagnetDownload(trimmed, magnetFiles)
+            return
+        }
         if (isYouTubePageLink(trimmed)) {
             if (!YoutubeRuntime.youtubeEnabled) {
                 youtubeResolveState = YoutubeResolveUiState.Failed("此版本不支持该链接类型。")
@@ -256,7 +335,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         val ctx = getApplication<Application>()
         val action = when {
-            trimmed.startsWith("magnet:?") -> DownloadForegroundService.ACTION_ADD_MAGNET
             trimmed.substringBefore("?").endsWith(".m3u8", ignoreCase = true) ->
                 DownloadForegroundService.ACTION_ADD_HLS
             else -> DownloadForegroundService.ACTION_ADD_HTTP
@@ -298,8 +376,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 isYouTubePageLink(line) -> skippedYoutube++
                 isPpnixSeriesPage(line) -> skippedSeries++
                 else -> {
-                    addLink(line, filename = if (lines.size == 1) filename else null)
-                    added++
+                    // 单行粘贴才弹磁力文件选择；多行粘贴直接全下，不逐个弹框。
+                    // 单条磁力走选择框时任务还没建（等用户勾选才建），不计入 added，
+                    // 否则“已添加 1 个任务”的提示会在用户取消选择后撒谎。
+                    val isSingleMagnetPicker = lines.size == 1 && line.startsWith("magnet:?")
+                    addLink(line, filename = if (lines.size == 1) filename else null, pickMagnetFiles = lines.size == 1)
+                    if (!isSingleMagnetPicker) added++
                 }
             }
         }
@@ -423,7 +505,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
             ContextCompat.startForegroundService(ctx, intent)
         } else {
-            addLink(task.sourceUrl, task.title)
+            // 重新下载不弹文件选择，带上原来选的文件（没选过就是全下）。
+            addLink(task.sourceUrl, task.title, pickMagnetFiles = false, magnetFiles = task.selectedFiles)
         }
     }
 

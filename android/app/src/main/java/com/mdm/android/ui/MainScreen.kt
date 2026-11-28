@@ -77,6 +77,7 @@ import com.mdm.android.service.YoutubeCookieStore
 import uniffi.mdm_android.DownloadKind
 import uniffi.mdm_android.DownloadState
 import uniffi.mdm_android.DownloadTask
+import uniffi.mdm_android.MagnetFileInfo
 import java.io.File
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
@@ -375,6 +376,31 @@ fun MainScreen(viewModel: MainViewModel) {
             initialAudioCeiling = state.initialAudioCeiling,
             onDismiss = { viewModel.dismissYoutubePicker() },
             onDownload = { viewModel.addYoutubeDownloads(it) }
+        )
+    }
+
+    // 磁力文件选择：单文件不弹框（直接下），多文件才弹列表让用户勾选。
+    when (val picker = viewModel.magnetPickerState) {
+        null -> Unit
+        MagnetPickerUiState.Loading -> AlertDialog(
+            onDismissRequest = { viewModel.dismissMagnetPicker() },
+            title = { Text("正在获取文件列表") },
+            text = {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 2.dp)
+                    Spacer(modifier = Modifier.width(12.dp))
+                    Text("正在读取种子文件列表，请稍候…")
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { viewModel.dismissMagnetPicker() }) { Text("取消") }
+            }
+        )
+        is MagnetPickerUiState.Ready -> MagnetFilePickerDialog(
+            title = picker.metadata.name,
+            files = picker.metadata.files,
+            onDismiss = { viewModel.dismissMagnetPicker() },
+            onConfirm = { viewModel.confirmMagnetDownload(picker.magnet, it) }
         )
     }
 
@@ -1287,6 +1313,101 @@ private fun AddLinkDialog(
                     selectedAudio
                 )
             }) { Text("开始下载") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("取消") }
+        }
+    )
+}
+
+/**
+ * 磁力/种子文件选择对话框（复用 YoutubePickerDialog 的多选样式）：
+ * 每行文件名 + 大小，默认全选；什么都不选时“开始下载”不可点。
+ * 注意：传回的是文件在种子里的原始下标（填充文件不占位、不重排），
+ * 引擎直接按它调 session.add。
+ */
+@Composable
+private fun MagnetFilePickerDialog(
+    title: String,
+    files: List<MagnetFileInfo>,
+    onDismiss: () -> Unit,
+    onConfirm: (List<UInt>) -> Unit
+) {
+    var selected by remember(files) { mutableStateOf(files.map { it.index }.toSet()) }
+    val allSelected = selected.size == files.size
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Text(
+                text = "$title（${files.size} 个文件）",
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis
+            )
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 260.dp, max = 560.dp)
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Checkbox(
+                        checked = allSelected,
+                        onCheckedChange = { checked ->
+                            selected = if (checked) files.map { it.index }.toSet() else emptySet()
+                        }
+                    )
+                    Text(
+                        if (allSelected) "已全选" else "全选",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Spacer(modifier = Modifier.weight(1f))
+                    Text(
+                        "已选 ${selected.size} 个",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                LazyColumn {
+                    items(files) { file ->
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Checkbox(
+                                checked = file.index in selected,
+                                onCheckedChange = { checked ->
+                                    selected =
+                                        if (checked) selected + file.index else selected - file.index
+                                }
+                            )
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    file.name,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis,
+                                    style = MaterialTheme.typography.bodyMedium
+                                )
+                                Text(
+                                    formatSize(file.size.toLong()),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = selected.isNotEmpty(),
+                onClick = { onConfirm(files.filter { it.index in selected }.map { it.index }) }
+            ) { Text("开始下载") }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) { Text("取消") }
