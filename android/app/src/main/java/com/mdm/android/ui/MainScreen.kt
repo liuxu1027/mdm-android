@@ -846,7 +846,19 @@ private fun DownloadTaskCard(
                                 "${formatDuration(elapsedSeconds)}/${formatDuration(remainingSeconds)}"
                             } else formatDuration(elapsedSeconds))
                         }
-                        if (taskCount > 1) add("$position/$taskCount")
+                        // HLS 显示已拉取的分片数（不是列表序号）；HTTP 没有分片概念，这行不显示。
+                        // 其它类型（磁力/YouTube）仍显示列表序号/总数。
+                        when (task.kind) {
+                            DownloadKind.HLS -> {
+                                if (task.totalSegments > 0u) {
+                                    add("已拉取 ${task.completedSegments}/${task.totalSegments} 分片")
+                                } else if (task.completedSegments > 0u) {
+                                    add("已拉取 ${task.completedSegments} 分片")
+                                }
+                            }
+                            DownloadKind.HTTP -> Unit
+                            else -> if (taskCount > 1) add("$position/$taskCount")
+                        }
                         if (task.speedBytesPerSec > 0uL) add(formatSpeed(task.speedBytesPerSec.toLong()))
                         if (minimalist && elapsedSeconds > 0L) {
                             add(if (remainingSeconds != null) {

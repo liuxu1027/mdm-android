@@ -89,6 +89,8 @@ class YoutubeDownloadManager(
             speedBytesPerSec = 0u,
             uploadSpeedBytesPerSec = 0u,
             activeConnections = 0u,
+            completedSegments = 0u,
+            totalSegments = 0u,
             errorMessage = null
         )
         synchronized(lock) { tasks[id] = task }

@@ -263,7 +263,8 @@ impl PtsAdFilter {
 
 /// 下载一个 m3u8 视频：拉播放列表 → 选清晰度 → 下分片（可解密）→ 合并成 .ts。
 ///
-/// `on_progress(已下字节, 预估总字节, 平均速度 B/s)`，总字节未知时为 0。
+/// `on_progress(已下字节, 预估总字节, 平均速度 B/s, 已拉取分片数, 总分片数)`，
+/// 总字节未知时为 0。
 /// `remove_ads` 开时：同一列表再拉一次，两次不一样的分片就是服务器动态
 /// 插进去的广告，跳过不下（实测：两次拉取除了 5 个广告分片外完全一样，
 /// 广告位置每次都变；两次一致或差异太多时不过滤，全部下载）。
@@ -273,7 +274,7 @@ pub async fn download_hls(
     playlist_url: &str,
     out_path: &Path,
     cancel: &Arc<AtomicBool>,
-    mut on_progress: impl FnMut(u64, u64, u64),
+    mut on_progress: impl FnMut(u64, u64, u64, u32, u32),
     remove_ads: bool,
     parallel_segments: usize,
 ) -> Result<(), String> {
@@ -518,6 +519,15 @@ pub async fn download_hls(
     let started = Instant::now();
     let resume_base = downloaded; // 续传时已有字节不计入本次速度
 
+    // 续传进来时先报一次进度：任务行立刻显示已拉取的分片数，不用等下一个分片写完。
+    on_progress(
+        downloaded,
+        total_bytes,
+        0,
+        start_idx as u32,
+        plans.len() as u32,
+    );
+
     // PTS 去广告的状态：基线（首个分片的时间戳）+ 已保留分片总时长。
     // 续传时从进度文件恢复基线和已丢时长；旧进度文件没有基线时，
     // 本次续传停掉 PTS 过滤（宁可留着广告也不错删正片）。
@@ -606,6 +616,8 @@ pub async fn download_hls(
                         downloaded,
                         est_total,
                         ((downloaded - resume_base) as f64 / elapsed) as u64,
+                        next_to_write as u32,
+                        plans.len() as u32,
                     );
                     // 每写完 parallel_segments 个或全部写完时记一次进度：这次失败的话，下次从这里继续。
                     // 进度文件共 5 行：地址、分片总数、已处理分片数、PTS 基线、已丢广告总时长。
