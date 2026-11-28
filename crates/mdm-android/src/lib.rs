@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -169,10 +169,27 @@ async fn acquire_task_slot(
     }
 }
 
+/// 磁力任务轮询循环的存活标记：resume_task 靠它判断“有没有循环在跑、
+/// 能接住 Queued 状态”。循环结束（完成/失败/任务删除/统计出错）时析构摘掉。
+struct TorrentLoopGuard {
+    loops: Arc<Mutex<HashSet<String>>>,
+    id: String,
+}
+
+impl Drop for TorrentLoopGuard {
+    fn drop(&mut self) {
+        if let Ok(mut set) = self.loops.lock() {
+            set.remove(&self.id);
+        }
+    }
+}
+
 /// Lazily start the shared BitTorrent session (or return the running one).
 async fn get_torrent_session(
     slot: &Arc<tokio::sync::Mutex<Option<Arc<Torrents>>>>,
     download_dir: &PathBuf,
+    tasks: &TaskMap,
+    hashes: &Arc<Mutex<HashMap<String, String>>>,
 ) -> Result<Arc<Torrents>, String> {
     let mut guard = slot.lock().await;
     if let Some(session) = guard.as_ref() {
@@ -197,7 +214,104 @@ async fn get_torrent_session(
     log::info!("BT 会话已启动");
     let session = Arc::new(session);
     *guard = Some(Arc::clone(&session));
+    // 会话刚建好就对账一次：清掉以前删除失败攒下的孤儿 torrent。
+    reconcile_torrent_orphans(&session, tasks, hashes).await;
     Ok(session)
+}
+
+/// 会话刚建好时对账：把会话里有、但任务列表里没有的 torrent 清掉。
+/// 这些是以前删除失败攒下的孤儿（删任务时只清了 TaskStore/UI，没清会话）。
+/// 有任何一个已列出任务的 hash 解析不出来时跳过整轮对账，避免误删。
+async fn reconcile_torrent_orphans(
+    session: &Arc<Torrents>,
+    tasks: &TaskMap,
+    hashes: &Arc<Mutex<HashMap<String, String>>>,
+) {
+    let mut known: HashSet<String> = HashSet::new();
+    if let Ok(map) = hashes.lock() {
+        known.extend(map.values().map(|h| h.to_ascii_lowercase()));
+    }
+    let mut underivable = false;
+    if let Ok(map) = tasks.lock() {
+        for task in map.values() {
+            let hash_opt = match task.kind {
+                DownloadKind::TorrentMagnet => magnet_info_hash(&task.source_url),
+                DownloadKind::TorrentFile => torrent_file_info_hash(&task.source_url),
+                _ => continue,
+            };
+            match hash_opt {
+                Some(h) => {
+                    known.insert(h);
+                }
+                None => {
+                    underivable = true;
+                }
+            }
+        }
+    }
+    if underivable {
+        log::warn!("[BT] 对账跳过：有已列出任务的 info-hash 解析不出来，怕误删孤儿");
+        return;
+    }
+    for hash in session.hashes() {
+        if !known.contains(&hash.to_ascii_lowercase()) {
+            log::info!("[BT] 对账：清掉孤儿 torrent {hash}");
+            if let Err(e) = session.remove(&hash, false).await {
+                log::warn!("[BT] 对账清理 {hash} 失败: {e}");
+            }
+        }
+    }
+}
+
+/// 从 magnet 链接里取 info-hash（小写 hex）。btih: 可能是 40 位 hex 或 32 位 base32。
+fn magnet_info_hash(uri: &str) -> Option<String> {
+    // 第一段是 "magnet:?xt=urn:btih:..."，先把 "magnet:?" 去掉再按 & 切。
+    let query = uri.strip_prefix("magnet:?").unwrap_or(uri);
+    let xt = query
+        .split('&')
+        .find_map(|part| part.strip_prefix("xt=urn:btih:"))?;
+    let xt = xt.trim();
+    if xt.len() == 40 && xt.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Some(xt.to_ascii_lowercase());
+    }
+    if xt.len() == 32 {
+        let bytes = decode_base32(xt)?;
+        if bytes.len() == 20 {
+            return Some(bytes.iter().map(|b| format!("{b:02x}")).collect());
+        }
+    }
+    None
+}
+
+/// RFC 4648 base32 解码（只认大写字母表；magnet 的 btih base32 是 32 字符 = 20 字节）。
+fn decode_base32(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(20);
+    let mut buf: u64 = 0;
+    let mut bits: u32 = 0;
+    for c in s.chars() {
+        let v = match c {
+            'A'..='Z' => c as u64 - 'A' as u64,
+            '2'..='7' => c as u64 - '2' as u64 + 26,
+            _ => return None,
+        };
+        buf = (buf << 5) | v;
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+        }
+    }
+    if bits >= 5 || (buf & ((1u64 << bits) - 1)) != 0 {
+        return None;
+    }
+    Some(out)
+}
+
+/// 从 .torrent 文件里取 info-hash：用上游 magnet_link 做本地解析，不用联网。
+fn torrent_file_info_hash(path: &str) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let link = mdm_torrent::magnet_link(&bytes)?;
+    magnet_info_hash(&link)
 }
 
 /// m3u8 出错自动重试的设置（对标 1DM 的重试设置）。
@@ -267,6 +381,9 @@ pub struct DownloadEngine {
     listener: ListenerSlot,
     http_handles: Arc<Mutex<HashMap<String, Arc<mdm_engine::download::Download>>>>,
     torrent_hashes: Arc<Mutex<HashMap<String, String>>>,
+    /// 正在跑轮询循环的磁力任务 id（见 TorrentLoopGuard）：resume_task 靠它
+    /// 判断“有没有循环在跑、能接住 Queued 状态”。
+    torrent_loops: Arc<Mutex<HashSet<String>>>,
     hls_cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     torrents: Arc<tokio::sync::Mutex<Option<Arc<Torrents>>>>,
     default_connections: Arc<Mutex<u32>>,
@@ -306,6 +423,7 @@ impl DownloadEngine {
             listener: Arc::new(Mutex::new(None)),
             http_handles: Arc::new(Mutex::new(HashMap::new())),
             torrent_hashes: Arc::new(Mutex::new(HashMap::new())),
+            torrent_loops: Arc::new(Mutex::new(HashSet::new())),
             hls_cancels: Arc::new(Mutex::new(HashMap::new())),
             torrents: Arc::new(tokio::sync::Mutex::new(None)),
             default_connections: Arc::new(Mutex::new(8)),
@@ -651,8 +769,12 @@ impl DownloadEngine {
                 {
                     let slot = Arc::clone(&self.torrents);
                     let download_dir = self.download_dir.clone();
+                    let tasks = Arc::clone(&self.tasks);
+                    let hashes = Arc::clone(&self.torrent_hashes);
                     self.runtime.spawn(async move {
-                        if let Ok(session) = get_torrent_session(&slot, &download_dir).await {
+                        if let Ok(session) =
+                            get_torrent_session(&slot, &download_dir, &tasks, &hashes).await
+                        {
                             let _ = session.pause(&hash).await;
                         }
                     });
@@ -701,35 +823,39 @@ impl DownloadEngine {
                     .lock()
                     .map(|map| map.get(&id).cloned())
                     .unwrap_or(None);
-                match hash_opt {
-                    Some(_hash) => {
+                // hash 在且轮询循环还活着：只改状态，循环里会调 session.resume。
+                // 循环已死（重启后恢复的任务没有循环在跑）：不能只改状态，
+                // 否则任务会永远卡在 Queued 没人恢复它，得按原链接重新加入会话。
+                let loop_alive = self
+                    .torrent_loops
+                    .lock()
+                    .map(|set| set.contains(&id))
+                    .unwrap_or(false);
+                if hash_opt.is_some() && loop_alive {
+                    self.update_state(&id, DownloadState::Queued)?;
+                    return Ok(());
+                }
+                // hash 丢了（重启后恢复），或循环已死：按存的链接重新加入会话，
+                // librqbit 会校验已下载的部分接着下。
+                let source_url = task.source_url.clone();
+                let kind = task.kind;
+                let src_opt = match kind {
+                    DownloadKind::TorrentMagnet => Source::magnet(&source_url),
+                    DownloadKind::TorrentFile => {
+                        std::fs::read(&source_url).ok().map(Source::File)
+                    }
+                    _ => None,
+                };
+                match src_opt {
+                    Some(src) => {
                         self.update_state(&id, DownloadState::Queued)?;
+                        self.run_torrent(id, src);
                         return Ok(());
                     }
                     None => {
-                        // 重启后恢复的磁力/种子任务：会话里的哈希记录已丢，
-                        // 按存的链接重新加入会话，librqbit 会校验已下载的部分接着下。
-                        let source_url = task.source_url.clone();
-                        let kind = task.kind;
-                        let src_opt = match kind {
-                            DownloadKind::TorrentMagnet => Source::magnet(&source_url),
-                            DownloadKind::TorrentFile => {
-                                std::fs::read(&source_url).ok().map(Source::File)
-                            }
-                            _ => None,
-                        };
-                        match src_opt {
-                            Some(src) => {
-                                self.update_state(&id, DownloadState::Queued)?;
-                                self.run_torrent(id, src);
-                                return Ok(());
-                            }
-                            None => {
-                                return Err(MdmError::InvalidInput {
-                                    reason: "无法恢复种子任务：链接无效".into(),
-                                });
-                            }
-                        }
+                        return Err(MdmError::InvalidInput {
+                            reason: "无法恢复种子任务：链接无效".into(),
+                        });
                     }
                 }
             }
@@ -739,12 +865,15 @@ impl DownloadEngine {
     /// 从列表移除任务。delete_files=true 时同时删掉磁盘上的文件
     /// （HTTP 的断点续传状态、HLS 的进度文件也一起删）；false 只从列表移除，文件留着。
     pub fn remove_task(&self, id: String, delete_files: bool) -> Result<(), MdmError> {
-        let removed = self
+        // 先只看任务不删：会话清理失败时返回错误，任务留在列表里可重试。
+        // 以前是先删列表再 fire-and-forget 清会话，失败了界面上也显示“已删”，
+        // 但 torrent 还在会话里跑，下次启动又恢复回来。
+        let task = self
             .tasks
             .lock()
-            .map(|mut map| map.remove(&id))
-            .unwrap_or(None);
-        let task = removed.ok_or_else(|| MdmError::NotFound { id: id.clone() })?;
+            .map(|map| map.get(&id).cloned())
+            .unwrap_or(None)
+            .ok_or_else(|| MdmError::NotFound { id: id.clone() })?;
 
         match task.kind {
             DownloadKind::Http => {
@@ -773,21 +902,49 @@ impl DownloadEngine {
                 }
             }
             _ => {
-                if let Some(hash) = self
+                // 磁力/种子任务：必须把 torrent 从 BT 会话里同步移除，否则删的只是
+                // 列表和库行，librqbit 下次启动会从 .torrent-state/SESSION/session.json
+                // 里把它恢复回来，后台继续下载（主界面还看不到）。
+                // hash 优先从内存 map 取；重启后 map 是空的，就从 magnet 链接的
+                // btih: 或种子文件里解析。
+                let hash_opt = self
                     .torrent_hashes
                     .lock()
                     .map(|mut map| map.remove(&id))
                     .unwrap_or(None)
-                {
-                    let slot = Arc::clone(&self.torrents);
-                    let download_dir = self.download_dir.clone();
-                    self.runtime.spawn(async move {
-                        if let Ok(session) = get_torrent_session(&slot, &download_dir).await {
-                            let _ = session.remove(&hash, delete_files).await;
-                        }
-                    });
+                    .or_else(|| magnet_info_hash(&task.source_url))
+                    .or_else(|| torrent_file_info_hash(&task.source_url));
+                match hash_opt {
+                    Some(hash) => {
+                        // 同步等 session.remove 完成再返回，失败就报错——不要
+                        // fire-and-forget，否则删和没删在界面上看起来一模一样。
+                        self.remove_torrent_from_session(&hash, delete_files)?;
+                        // session.delete 应该已经清掉了持久化文件；再显式删一次兜底。
+                        // 注意：只在删任务时清这两个文件；还在列表里的任务照样存着，
+                        // 磁力断点续传就靠它俩。
+                        let session_dir =
+                            self.download_dir.join(".torrent-state").join("session");
+                        let lower = hash.to_ascii_lowercase();
+                        let _ = std::fs::remove_file(
+                            session_dir.join(format!("{lower}.torrent")),
+                        );
+                        let _ = std::fs::remove_file(
+                            session_dir.join(format!("{lower}.bitv")),
+                        );
+                    }
+                    None => {
+                        // 解析不出 hash：这次删不掉会话里的 torrent，
+                        // 下次会话启动时的对账会把它当孤儿清掉。
+                        log::warn!(
+                            "[BT] 删除任务 {id}：解析不出 info-hash，会话里的 torrent 将在下次启动对账时清理"
+                        );
+                    }
                 }
             }
+        }
+        // 清理成功后才从列表里拿掉任务。
+        if let Ok(mut map) = self.tasks.lock() {
+            map.remove(&id);
         }
         notify_all(&self.tasks, &self.listener);
         Ok(())
@@ -878,6 +1035,19 @@ impl DownloadEngine {
         task.speed_bytes_per_sec = 0;
         task.upload_speed_bytes_per_sec = 0;
         task.active_connections = 0;
+        // 磁力/种子任务：把 hash 写回内存 map，否则重启后暂停/删除都找不到它
+        // （删除时 session.remove 不执行，就是删了又回来的根因之一）。
+        // 注意只写 map，不启动会话；会话启动时由 get_torrent_session 里的对账处理。
+        let hash_opt = match task.kind {
+            DownloadKind::TorrentMagnet => magnet_info_hash(&task.source_url),
+            DownloadKind::TorrentFile => torrent_file_info_hash(&task.source_url),
+            _ => None,
+        };
+        if let Some(hash) = hash_opt {
+            if let Ok(mut map) = self.torrent_hashes.lock() {
+                map.insert(task.id.clone(), hash);
+            }
+        }
         self.insert_task(task);
         Ok(())
     }
@@ -909,6 +1079,45 @@ impl DownloadEngine {
         }
         notify_all(&self.tasks, &self.listener);
         Ok(())
+    }
+
+    /// 把一个 torrent 从 BT 会话里同步移除（session.remove 会更新 session.json
+    /// 持久化），失败时返回错误，调用方不要吞掉。
+    /// 只在 Kotlin/JNI 线程上调（remove_task 的调用方），不要在运行时里调：
+    /// 里面用了 block_on，在运行时 worker 线程上调会 panic。
+    fn remove_torrent_from_session(&self, hash: &str, delete_files: bool) -> Result<(), MdmError> {
+        match self.torrents.try_lock() {
+            Ok(guard) if guard.is_none() => {
+                // 会话没启动：拿着 guard 删持久化文件（别的线程这时启动不了会话）。
+                // 等 guard 放掉、会话下次启动时读到 .torrent 文件没了，
+                // 上游 prepare_saved 会把 session.json 里这条也清掉，恢复不了。
+                // 注意这里不启动会话：只为删一个 torrent 而启动整个会话，
+                // 反而会把 session.json 里的孤儿全恢复回来开始下载。
+                let session_dir = self.download_dir.join(".torrent-state").join("session");
+                let lower = hash.to_ascii_lowercase();
+                let _ = std::fs::remove_file(session_dir.join(format!("{lower}.torrent")));
+                let _ = std::fs::remove_file(session_dir.join(format!("{lower}.bitv")));
+                Ok(())
+            }
+            _ => {
+                // 会话在跑（或正在启动）：同步等 session.remove 完成再返回。
+                let slot = Arc::clone(&self.torrents);
+                let download_dir = self.download_dir.clone();
+                let tasks = Arc::clone(&self.tasks);
+                let hashes = Arc::clone(&self.torrent_hashes);
+                let hash = hash.to_string();
+                self.runtime.block_on(async move {
+                    let session = get_torrent_session(&slot, &download_dir, &tasks, &hashes)
+                        .await
+                        .map_err(|e| MdmError::Engine { reason: e })?;
+                    session.remove(&hash, delete_files).await.map_err(|e| {
+                        MdmError::Engine {
+                            reason: format!("从 BT 会话移除失败: {e}"),
+                        }
+                    })
+                })
+            }
+        }
     }
 
     /// Start (or resume) a real HTTP/FTP download with the upstream engine,
@@ -1194,6 +1403,7 @@ impl DownloadEngine {
         let tasks = Arc::clone(&self.tasks);
         let listener = Arc::clone(&self.listener);
         let hashes = Arc::clone(&self.torrent_hashes);
+        let loops = Arc::clone(&self.torrent_loops);
         let slot = Arc::clone(&self.torrents);
         let download_dir = self.download_dir.clone();
         let dl_limit = Arc::clone(&self.speed_limit_bps);
@@ -1202,6 +1412,12 @@ impl DownloadEngine {
         let active_tasks = Arc::clone(&self.active_tasks);
 
         self.runtime.spawn(async move {
+            // 轮询循环存活标记：resume_task 靠它判断“有没有循环在跑、能接住 Queued”。
+            // 循环结束（完成/失败/任务删除/统计出错）时 guard 析构，自动摘掉标记。
+            let _loop_guard = TorrentLoopGuard {
+                loops,
+                id: task_id.clone(),
+            };
             let Some(task_slot) = acquire_task_slot(
                 &tasks,
                 &listener,
@@ -1214,7 +1430,7 @@ impl DownloadEngine {
                 return;
             };
             let mut task_slot = Some(task_slot);
-            let session = match get_torrent_session(&slot, &download_dir).await {
+            let session = match get_torrent_session(&slot, &download_dir, &tasks, &hashes).await {
                 Ok(s) => s,
                 Err(e) => {
                     log::error!("BT 会话启动失败: {e}");
