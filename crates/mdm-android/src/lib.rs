@@ -707,34 +707,6 @@ impl DownloadEngine {
         Ok(id)
     }
 
-    /// 取一份种子元数据并转成文件列表（给选择对话框用）。
-    /// 磁力要走 DHT（120 秒超时），种子文件直接从文件字节解析，不用等 peer。
-    async fn metadata_file_list(
-        session: &Arc<Torrents>,
-        src: &Source,
-    ) -> Result<MagnetMetadata, MdmError> {
-        let meta = session
-            .metadata(src, Duration::from_secs(120), None)
-            .await
-            .map_err(|e| MdmError::Engine {
-                reason: format!("获取种子信息失败: {e}"),
-            })?;
-        Ok(MagnetMetadata {
-            name: meta.name.clone(),
-            files: meta
-                .files
-                .iter()
-                .enumerate()
-                .filter(|(_, f)| !f.padding)
-                .map(|(i, f)| MagnetFileInfo {
-                    index: i as u32,
-                    name: f.path.to_string_lossy().to_string(),
-                    size: f.size,
-                })
-                .collect(),
-        })
-    }
-
     /// 取磁力元数据（文件列表）：只拿列表不开始下载，给文件选择对话框用。
     /// 120 秒内拿不到（无 peer、DHT 慢）就报错，调用方回退到“全下”，不要卡住。
     /// 注意是同步阻塞调用（里面用了 block_on），只在 Kotlin 的 IO 线程上调，
@@ -1247,6 +1219,34 @@ impl DownloadEngine {
 }
 
 impl DownloadEngine {
+    /// 取一份种子元数据并转成文件列表（给选择对话框用）。
+    /// 磁力要走 DHT（120 秒超时），种子文件直接从文件字节解析，不用等 peer。
+    async fn metadata_file_list(
+        session: &Arc<Torrents>,
+        src: &Source,
+    ) -> Result<MagnetMetadata, MdmError> {
+        let meta = session
+            .metadata(src, Duration::from_secs(120), None)
+            .await
+            .map_err(|e| MdmError::Engine {
+                reason: format!("获取种子信息失败: {e}"),
+            })?;
+        Ok(MagnetMetadata {
+            name: meta.name.clone(),
+            files: meta
+                .files
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| !f.padding)
+                .map(|(i, f)| MagnetFileInfo {
+                    index: i as u32,
+                    name: f.path.to_string_lossy().to_string(),
+                    size: f.size,
+                })
+                .collect(),
+        })
+    }
+
     fn insert_task(&self, task: DownloadTask) {
         if let Ok(mut map) = self.tasks.lock() {
             map.insert(task.id.clone(), task);
