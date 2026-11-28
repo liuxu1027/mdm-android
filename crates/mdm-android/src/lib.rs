@@ -707,6 +707,34 @@ impl DownloadEngine {
         Ok(id)
     }
 
+    /// 取一份种子元数据并转成文件列表（给选择对话框用）。
+    /// 磁力要走 DHT（120 秒超时），种子文件直接从文件字节解析，不用等 peer。
+    async fn metadata_file_list(
+        session: &Arc<Torrents>,
+        src: &Source,
+    ) -> Result<MagnetMetadata, MdmError> {
+        let meta = session
+            .metadata(src, Duration::from_secs(120), None)
+            .await
+            .map_err(|e| MdmError::Engine {
+                reason: format!("获取种子信息失败: {e}"),
+            })?;
+        Ok(MagnetMetadata {
+            name: meta.name.clone(),
+            files: meta
+                .files
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| !f.padding)
+                .map(|(i, f)| MagnetFileInfo {
+                    index: i as u32,
+                    name: f.path.to_string_lossy().to_string(),
+                    size: f.size,
+                })
+                .collect(),
+        })
+    }
+
     /// 取磁力元数据（文件列表）：只拿列表不开始下载，给文件选择对话框用。
     /// 120 秒内拿不到（无 peer、DHT 慢）就报错，调用方回退到“全下”，不要卡住。
     /// 注意是同步阻塞调用（里面用了 block_on），只在 Kotlin 的 IO 线程上调，
@@ -723,26 +751,31 @@ impl DownloadEngine {
             let session = get_torrent_session(&slot, &download_dir, &tasks, &hashes)
                 .await
                 .map_err(|e| MdmError::Engine { reason: e })?;
-            let meta = session
-                .metadata(&src, Duration::from_secs(120), None)
+            Self::metadata_file_list(&session, &src).await
+        })
+    }
+
+    /// 取 .torrent 文件的元数据（文件列表）：元数据就在文件里，直接解析，
+    /// 不用等 DHT 找 peer；选完文件马上就能弹列表。
+    /// 注意是同步阻塞调用（里面用了 block_on），只在 Kotlin 的 IO 线程上调，
+    /// 不要在运行时 worker 线程上调。
+    pub fn fetch_torrent_file_metadata(
+        &self,
+        torrent_path: String,
+    ) -> Result<MagnetMetadata, MdmError> {
+        let bytes = std::fs::read(&torrent_path).map_err(|_| MdmError::Storage {
+            reason: format!("Torrent file not found: {torrent_path}"),
+        })?;
+        let src = Source::File(bytes);
+        let slot = Arc::clone(&self.torrents);
+        let download_dir = self.download_dir.clone();
+        let tasks = Arc::clone(&self.tasks);
+        let hashes = Arc::clone(&self.torrent_hashes);
+        self.runtime.block_on(async move {
+            let session = get_torrent_session(&slot, &download_dir, &tasks, &hashes)
                 .await
-                .map_err(|e| MdmError::Engine {
-                    reason: format!("获取种子信息失败: {e}"),
-                })?;
-            Ok(MagnetMetadata {
-                name: meta.name.clone(),
-                files: meta
-                    .files
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, f)| !f.padding)
-                    .map(|(i, f)| MagnetFileInfo {
-                        index: i as u32,
-                        name: f.path.to_string_lossy().to_string(),
-                        size: f.size,
-                    })
-                    .collect(),
-            })
+                .map_err(|e| MdmError::Engine { reason: e })?;
+            Self::metadata_file_list(&session, &src).await
         })
     }
 
@@ -794,6 +827,16 @@ impl DownloadEngine {
     }
 
     pub fn add_torrent_file(&self, torrent_path: String) -> Result<String, MdmError> {
+        self.add_torrent_file_with_files(torrent_path, vec![])
+    }
+
+    /// 加 .torrent 文件下载（带选中文件索引）：files 为空 = 全下。
+    /// 选中列表存在任务里，重启、续传、重新下载时带上，否则会变全下。
+    pub fn add_torrent_file_with_files(
+        &self,
+        torrent_path: String,
+        files: Vec<u32>,
+    ) -> Result<String, MdmError> {
         let path = PathBuf::from(&torrent_path);
         let bytes = std::fs::read(&path).map_err(|_| MdmError::Storage {
             reason: format!("Torrent file not found: {torrent_path}"),
@@ -805,6 +848,8 @@ impl DownloadEngine {
             .and_then(|n| n.to_str())
             .unwrap_or("torrent")
             .to_string();
+        let selected_files: Option<Vec<u32>> =
+            if files.is_empty() { None } else { Some(files) };
 
         let task = DownloadTask {
             id: id.clone(),
@@ -820,12 +865,12 @@ impl DownloadEngine {
             active_connections: 0,
             completed_segments: 0,
             total_segments: 0,
-            selected_files: None,
+            selected_files: selected_files.clone(),
             error_message: None,
         };
 
         self.insert_task(task);
-        self.run_torrent(id.clone(), Source::File(bytes), None);
+        self.run_torrent(id.clone(), Source::File(bytes), selected_files);
 
         Ok(id)
     }

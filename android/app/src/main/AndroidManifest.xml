@@ -51,6 +51,25 @@
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="magnet" />
             </intent-filter>
+
+            <!-- 点文件管理器里的 .torrent 文件直接用 mdm 打开（按 MIME 匹配） -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" android:mimeType="application/x-bittorrent" />
+                <data android:scheme="file" android:mimeType="application/x-bittorrent" />
+            </intent-filter>
+
+            <!-- 点文件管理器里的 .torrent 文件直接用 mdm 打开（按 .torrent 后缀匹配， -->
+            <!-- 有些文件管理器不报 MIME 类型，只给路径） -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" android:pathPattern=".*\.torrent" />
+                <data android:scheme="file" android:pathPattern=".*\.torrent" />
+            </intent-filter>
         </activity>
 
         <service

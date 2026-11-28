@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.provider.DocumentsContract
+import android.provider.OpenableColumns
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
@@ -33,6 +34,9 @@ import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 
+/** 选 .torrent 文件时拷到应用私有目录下的子目录（断点续传按路径重读它）。 */
+private const val TORRENT_FILES_DIR = "torrent-files"
+
 sealed class YoutubeResolveUiState {
     object Idle : YoutubeResolveUiState()
     object Loading : YoutubeResolveUiState()
@@ -44,10 +48,14 @@ sealed class YoutubeResolveUiState {
     data class Failed(val message: String) : YoutubeResolveUiState()
 }
 
-/** 磁力文件选择：粘贴磁力后先拿文件列表，再让用户勾选。 */
+/** 磁力/种子文件选择：粘贴磁力或选 .torrent 文件后先拿文件列表，再让用户勾选。 */
 sealed class MagnetPickerUiState {
     object Loading : MagnetPickerUiState()
-    data class Ready(val magnet: String, val metadata: MagnetMetadata) : MagnetPickerUiState()
+    data class Ready(
+        val source: String,
+        val metadata: MagnetMetadata,
+        val isTorrentFile: Boolean = false
+    ) : MagnetPickerUiState()
 }
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -109,6 +117,96 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun confirmMagnetDownload(magnet: String, files: List<UInt>) {
         magnetPickerState = null
         addMagnetDownload(magnet, files)
+    }
+
+    /**
+     * 从系统文件选择器 / 文件管理器打开 .torrent 文件：
+     * 先把文件拷到应用私有目录（断点续传要按路径重读它，SAF 的 content:// 链接
+     * 进程重启后就读不到了），再走文件选择流程。
+     */
+    fun addTorrentFile(uri: Uri) {
+        viewModelScope.launch {
+            val path = runCatching {
+                withContext(Dispatchers.IO) { copyTorrentFile(uri) }
+            }.getOrNull()
+            if (path == null) {
+                batchMessage = "读取 .torrent 文件失败"
+                return@launch
+            }
+            startTorrentFilePicker(path)
+        }
+    }
+
+    private fun copyTorrentFile(uri: Uri): String {
+        val ctx = getApplication<Application>()
+        val name = runCatching {
+            ctx.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+                if (c.moveToFirst()) c.getString(0) else null
+            }
+        }.getOrNull()?.takeIf { it.isNotBlank() } ?: "file.torrent"
+        val stem = name.substringBeforeLast('.', name).takeIf { it.isNotBlank() } ?: "file"
+        val safe = stem.filter { it.isLetterOrDigit() || it in "-_." }.takeIf { it.isNotBlank() } ?: "file"
+        val dir = File(ctx.filesDir, TORRENT_FILES_DIR).apply { mkdirs() }
+        var target = File(dir, "$safe.torrent")
+        var n = 1
+        while (target.exists()) {
+            target = File(dir, "$safe-$n.torrent")
+            n++
+        }
+        ctx.contentResolver.openInputStream(uri)?.use { input ->
+            target.outputStream().use { output -> input.copyTo(output) }
+        } ?: error("无法打开文件")
+        return target.absolutePath
+    }
+
+    /**
+     * .torrent 文件选择：元数据就在文件里，直接解析，不用等 DHT 找 peer，
+     * 选完文件马上就能弹列表。单文件直接跳过选择全下。
+     * 注意：文件解析失败时不回退到“全下”（引擎一样读不出来），直接报错。
+     */
+    fun startTorrentFilePicker(path: String) {
+        magnetPickerJob?.cancel()
+        magnetPickerState = MagnetPickerUiState.Loading
+        magnetPickerJob = viewModelScope.launch {
+            try {
+                val metadata = withContext(Dispatchers.IO) {
+                    val engine = EngineRegistry.engine ?: error("下载引擎尚未启动")
+                    engine.fetchTorrentFileMetadata(path)
+                }
+                if (metadata.files.size <= 1) {
+                    magnetPickerState = null
+                    addTorrentFileDownload(path, null)
+                } else {
+                    magnetPickerState = MagnetPickerUiState.Ready(path, metadata, isTorrentFile = true)
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                magnetPickerState = null
+                batchMessage = "读取 .torrent 文件失败：${error.message?.take(80)?.ifBlank { null } ?: "文件无效"}"
+            }
+        }
+    }
+
+    /** 文件选择对话框里点“开始下载”：带选中索引进下载。 */
+    fun confirmTorrentDownload(path: String, files: List<UInt>) {
+        magnetPickerState = null
+        addTorrentFileDownload(path, files)
+    }
+
+    private fun addTorrentFileDownload(path: String, files: List<UInt>?) {
+        val ctx = getApplication<Application>()
+        val intent = Intent(ctx, DownloadForegroundService::class.java).apply {
+            action = DownloadForegroundService.ACTION_ADD_TORRENT_FILE
+            putExtra(DownloadForegroundService.EXTRA_URL, path)
+            if (!files.isNullOrEmpty()) {
+                putIntegerArrayListExtra(
+                    DownloadForegroundService.EXTRA_TORRENT_FILES,
+                    ArrayList(files.map { it.toInt() })
+                )
+            }
+        }
+        ContextCompat.startForegroundService(ctx, intent)
     }
 
     private fun addMagnetDownload(magnet: String, files: List<UInt>?) {
@@ -567,6 +665,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             ContextCompat.startForegroundService(ctx, intent)
         } else {
             runCatching { EngineRegistry.engine?.removeTask(id, deleteFiles) }
+            // .torrent 任务删掉后，把前面拷到应用私有目录的那份种子文件也清掉
+            // （mdm 自己拷的副本，不是用户的文件；只清 torrent-files 目录下的）。
+            if (task?.kind == DownloadKind.TORRENT_FILE) {
+                val path = task.sourceUrl
+                val dir = File(getApplication<Application>().filesDir, TORRENT_FILES_DIR)
+                if (path.startsWith(dir.absolutePath + File.separator)) {
+                    runCatching { File(path).delete() }
+                }
+            }
         }
     }
 

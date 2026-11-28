@@ -129,6 +129,9 @@ fun MainScreen(viewModel: MainViewModel) {
         onDispose { context.unregisterReceiver(receiver) }
     }
     val hasActiveDownload = tasks.any { it.state == DownloadState.DOWNLOADING }
+    val torrentFilePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) viewModel.addTorrentFile(uri)
+    }
     val folderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { treeUri ->
         val operation = pendingFileOperation
         val task = tasks.firstOrNull { it.id == fileOpsTaskId }
@@ -318,6 +321,10 @@ fun MainScreen(viewModel: MainViewModel) {
         AddLinkDialog(
             youtubeEnabled = YoutubeRuntime.youtubeEnabled,
             onDismiss = { showAddDialog = false },
+            onPickTorrentFile = {
+                showAddDialog = false
+                torrentFilePicker.launch(arrayOf("application/x-bittorrent"))
+            },
             onConfirm = { link, name, height, audio ->
                 val lines = link.lines().map { it.trim() }.filter { it.isNotEmpty() }
                 when {
@@ -400,7 +407,10 @@ fun MainScreen(viewModel: MainViewModel) {
             title = picker.metadata.name,
             files = picker.metadata.files,
             onDismiss = { viewModel.dismissMagnetPicker() },
-            onConfirm = { viewModel.confirmMagnetDownload(picker.magnet, it) }
+            onConfirm = {
+                if (picker.isTorrentFile) viewModel.confirmTorrentDownload(picker.source, it)
+                else viewModel.confirmMagnetDownload(picker.source, it)
+            }
         )
     }
 
@@ -1198,6 +1208,7 @@ private fun findPlayableFile(root: File): File? {
 private fun AddLinkDialog(
     youtubeEnabled: Boolean,
     onDismiss: () -> Unit,
+    onPickTorrentFile: () -> Unit,
     onConfirm: (String, String?, Int?, Int?) -> Unit
 ) {
     var text by remember { mutableStateOf("") }
@@ -1246,6 +1257,15 @@ private fun AddLinkDialog(
                         modifier = Modifier.fillMaxWidth()
                     )
                 }
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedButton(
+                    onClick = onPickTorrentFile,
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("选择 .torrent 文件") }
+                Text(
+                    "有 .torrent 文件也可以直接选：单文件直接下载，多文件会弹列表让您勾选。",
+                    style = MaterialTheme.typography.bodySmall
+                )
                 if (isYoutube && youtubeEnabled) {
                     Spacer(modifier = Modifier.height(10.dp))
                     Text("视频清晰度", style = MaterialTheme.typography.titleSmall)

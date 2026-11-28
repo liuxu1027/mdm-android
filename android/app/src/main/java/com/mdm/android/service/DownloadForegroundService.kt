@@ -106,6 +106,17 @@ class DownloadForegroundService : Service(), ProgressListener {
                     }.getOrNull()?.let(::noteTaskCreated)
                 }
             }
+            ACTION_ADD_TORRENT_FILE -> {
+                val path = intent.getStringExtra(EXTRA_URL)
+                if (!path.isNullOrBlank()) {
+                    // 带选中文件索引时走多文件选择那路；没带就是全下。
+                    val files = intent.getIntegerArrayListExtra(EXTRA_TORRENT_FILES)
+                    runCatching {
+                        if (!files.isNullOrEmpty()) engine?.addTorrentFileWithFiles(path, files.map { it.toUInt() })
+                        else engine?.addTorrentFile(path)
+                    }.getOrNull()?.let(::noteTaskCreated)
+                }
+            }
             ACTION_ADD_HLS -> {
                 val url = intent.getStringExtra(EXTRA_URL)
                 if (!url.isNullOrBlank()) {
@@ -341,6 +352,7 @@ class DownloadForegroundService : Service(), ProgressListener {
         const val NOTIFICATION_ID = 1001
         const val ACTION_ADD_HTTP = "com.mdm.android.ADD_HTTP"
         const val ACTION_ADD_MAGNET = "com.mdm.android.ADD_MAGNET"
+        const val ACTION_ADD_TORRENT_FILE = "com.mdm.android.ADD_TORRENT_FILE"
         const val ACTION_ADD_HLS = "com.mdm.android.ADD_HLS"
         const val ACTION_ADD_YOUTUBE = "com.mdm.android.ADD_YOUTUBE"
         const val ACTION_ADD_YOUTUBE_BATCH = "com.mdm.android.ADD_YOUTUBE_BATCH"
@@ -367,6 +379,7 @@ class DownloadForegroundService : Service(), ProgressListener {
         const val EXTRA_YOUTUBE_AUDIO_ONLY = "extra_youtube_audio_only"
         const val EXTRA_YTDLP_STATUS = "extra_ytdlp_status"
         const val EXTRA_MAGNET_FILES = "extra_magnet_files"
+        const val EXTRA_TORRENT_FILES = "extra_torrent_files"
 
         /** 是否有“所有文件访问权限”（Android 11+）。 */
         fun hasAllFilesAccess(context: Context): Boolean =

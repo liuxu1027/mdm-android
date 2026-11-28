@@ -44,7 +44,16 @@ class MainActivity : ComponentActivity() {
                 intent.getStringExtra(Intent.EXTRA_TEXT)?.let { viewModel.addLink(it) }
             }
             Intent.ACTION_VIEW -> {
-                intent.dataString?.let { viewModel.addLink(it) }
+                val uri = intent.data
+                // 文件管理器里点的 .torrent 文件：按 MIME 或 .torrent 后缀认出来，
+                // 走种子文件那路（先拷到应用私有目录再弹文件列表）；其余的还是按链接处理。
+                if (uri != null && (intent.type == "application/x-bittorrent" ||
+                        uri.path?.endsWith(".torrent", ignoreCase = true) == true)
+                ) {
+                    viewModel.addTorrentFile(uri)
+                } else {
+                    intent.dataString?.let { viewModel.addLink(it) }
+                }
             }
         }
     }
